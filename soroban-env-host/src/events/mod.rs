@@ -1,22 +1,19 @@
 pub(crate) mod diagnostic;
 mod internal;
 pub(crate) mod system_events;
-
 pub(crate) use internal::{
     EventError, InternalDiagnosticArg, InternalDiagnosticEvent, InternalEventsBuffer,
 };
 // expose them as pub use for benches
-pub use internal::{InternalContractEvent, InternalEvent};
-use soroban_env_common::{
+use crate::{
     num::{i256_from_pieces, u256_from_pieces},
     xdr::{
         ContractEventBody, ContractEventType, ContractExecutable, PublicKey::PublicKeyTypeEd25519,
         ScAddress, ScContractInstance, ScVal,
     },
-    Error, Val, VecObject,
+    Error, Host, HostError, Val, VecObject,
 };
-
-use crate::{Host, HostError};
+pub(crate) use internal::{InternalContractEvent, InternalEvent};
 
 /// The external representation of a host event.
 #[derive(Clone, Debug)]
@@ -29,9 +26,15 @@ pub struct HostEvent {
 fn display_address(addr: &ScAddress, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match addr {
         ScAddress::Account(acct) => match &acct.0 {
-            PublicKeyTypeEd25519(e) => write!(f, "Address(Account({}))", e),
+            PublicKeyTypeEd25519(e) => {
+                let strkey = stellar_strkey::ed25519::PublicKey(e.0);
+                write!(f, "{}", strkey)
+            }
         },
-        ScAddress::Contract(hash) => write!(f, "Address(Contract({}))", hash),
+        ScAddress::Contract(hash) => {
+            let strkey = stellar_strkey::Contract(hash.0);
+            write!(f, "{}", strkey)
+        }
     }
 }
 
@@ -112,7 +115,10 @@ impl core::fmt::Display for HostEvent {
         }
         match &self.event.contract_id {
             None => (),
-            Some(hash) => write!(f, "contract:{}, ", *hash)?,
+            Some(hash) => {
+                let strkey = stellar_strkey::Contract(hash.0);
+                write!(f, "contract:{}, ", strkey)?
+            }
         }
         match &self.event.body {
             ContractEventBody::V0(ceb) => {
@@ -130,6 +136,34 @@ impl core::fmt::Display for HostEvent {
     }
 }
 
+#[test]
+fn host_event_contract_id_is_strkey() {
+    use crate::xdr::{
+        AccountId, ContractEvent, ContractEventBody, ContractEventType, ContractEventV0,
+        ExtensionPoint, Hash, PublicKey,
+    };
+    let he = HostEvent {
+        event: ContractEvent {
+            ext: ExtensionPoint::V0,
+            contract_id: Some(Hash([0; 32])),
+            type_: ContractEventType::Diagnostic,
+            body: ContractEventBody::V0(ContractEventV0 {
+                topics: vec![ScVal::Address(ScAddress::Account(AccountId(
+                    PublicKey::PublicKeyTypeEd25519([0; 32].into()),
+                )))]
+                .try_into()
+                .unwrap(),
+                data: ScVal::Void,
+            }),
+        },
+        failed_call: false,
+    };
+    assert_eq!(
+        format!("{}", he),
+        "[Diagnostic Event] contract:CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4, topics:[GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF], data:Void"
+    );
+}
+
 /// The external representation of events in the chronological order.
 #[derive(Clone, Debug, Default)]
 pub struct Events(pub Vec<HostEvent>);
@@ -144,6 +178,11 @@ impl Host {
 
     pub fn get_events(&self) -> Result<Events, HostError> {
         self.try_borrow_events()?.externalize(self)
+    }
+
+    #[cfg(any(test, feature = "testutils"))]
+    pub fn get_diagnostic_events(&self) -> Result<Events, HostError> {
+        self.try_borrow_events()?.externalize_diagnostics(self)
     }
 
     // Records a contract event.

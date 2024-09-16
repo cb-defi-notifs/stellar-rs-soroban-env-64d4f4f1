@@ -9,7 +9,7 @@ use crate::{
 
 #[test]
 fn deep_scval_to_host_val() -> Result<(), HostError> {
-    let host = observe_host!(Host::default());
+    let host = observe_host!(Host::test_host());
     host.as_budget().reset_unlimited()?;
 
     let mut v = ScVec::default();
@@ -26,14 +26,14 @@ fn deep_scval_to_host_val() -> Result<(), HostError> {
     // NB: this error code is not great, it's a consequence of
     // bug https://github.com/stellar/rs-soroban-env/issues/1046
     // where the TryIntoVal impl in common eats HostErrors
-    let code = (ScErrorType::Value, ScErrorCode::UnexpectedType);
+    let code = (ScErrorType::Context, ScErrorCode::ExceededLimit);
     assert!(HostError::result_matches_err(res, code));
     Ok(())
 }
 
 #[test]
 fn deep_host_val_to_scval() -> Result<(), HostError> {
-    let host = observe_host!(Host::default());
+    let host = observe_host!(Host::test_host());
     host.as_budget().reset_unlimited()?;
 
     let mut hv = host.test_vec_obj::<u32>(&[])?;
@@ -42,17 +42,14 @@ fn deep_host_val_to_scval() -> Result<(), HostError> {
         hv = host.vec_push_back(vv, hv.to_val())?;
     }
     let res = host.from_host_obj(hv);
-    // NB: this error code is not great, it's a consequence of
-    // bug https://github.com/stellar/rs-soroban-env/issues/1046
-    // where the TryIntoVal impl in common eats HostErrors
-    let code = (ScErrorType::Value, ScErrorCode::UnexpectedType);
+    let code = (ScErrorType::Context, ScErrorCode::ExceededLimit);
     assert!(HostError::result_matches_err(res, code));
     Ok(())
 }
 
 #[test]
 fn deep_host_obj_clone() -> Result<(), HostError> {
-    let host = observe_host!(Host::default());
+    let host = observe_host!(Host::test_host());
     host.as_budget().reset_unlimited()?;
 
     let mut v = ScVec::default();
@@ -69,7 +66,7 @@ fn deep_host_obj_clone() -> Result<(), HostError> {
 
 #[test]
 fn deep_host_obj_cmp() -> Result<(), HostError> {
-    let host = observe_host!(Host::default());
+    let host = observe_host!(Host::test_host());
     host.as_budget().reset_unlimited()?;
 
     let mut hv = host.test_vec_obj::<u32>(&[])?;

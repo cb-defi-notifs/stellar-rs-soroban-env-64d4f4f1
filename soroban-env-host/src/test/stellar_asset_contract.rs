@@ -1,9 +1,9 @@
 use std::{convert::TryInto, rc::Rc};
 
 use crate::builtin_contracts::base_types::BytesN;
+use crate::testutils::simple_account_sign_fn;
 use crate::{
     auth::RecordedAuthPayload,
-    budget::AsBudget,
     builtin_contracts::{
         base_types::Address,
         contract_error::ContractError,
@@ -17,23 +17,16 @@ use crate::{
     },
     host::{frame::TestContractFrame, Frame},
     testutils::generate_bytes_array,
-    Host, HostError, LedgerInfo,
-};
-use ed25519_dalek::SigningKey;
-use soroban_env_common::{
     xdr::{
-        self, AccountFlags, ContractEventType, ContractExecutable, InvokeContractArgs, ScAddress,
-        ScContractInstance, ScSymbol, ScVal, SorobanAuthorizedFunction,
-        SorobanAuthorizedInvocation,
-    },
-    xdr::{
-        AccountId, AlphaNum12, AlphaNum4, Asset, AssetCode12, AssetCode4, Hash, LedgerEntryData,
-        LedgerKey, Liabilities, PublicKey, ScErrorCode, ScErrorType, TrustLineEntry,
+        self, AccountFlags, AccountId, AlphaNum12, AlphaNum4, Asset, AssetCode12, AssetCode4,
+        ContractEventType, ContractExecutable, Hash, InvokeContractArgs, LedgerEntryData,
+        LedgerKey, Liabilities, PublicKey, ScAddress, ScContractInstance, ScErrorCode, ScErrorType,
+        ScSymbol, ScVal, SorobanAuthorizedFunction, SorobanAuthorizedInvocation, TrustLineEntry,
         TrustLineEntryExt, TrustLineEntryV1, TrustLineEntryV1Ext, TrustLineFlags,
     },
-    EnvBase, Val,
+    Env, EnvBase, Host, HostError, LedgerInfo, Symbol, TryFromVal, TryIntoVal, Val,
 };
-use soroban_env_common::{Env, Symbol, TryFromVal, TryIntoVal};
+use ed25519_dalek::SigningKey;
 use soroban_test_wasms::{
     ERR, INVOKE_CONTRACT, SAC_REENTRY_TEST_CONTRACT, SIMPLE_ACCOUNT_CONTRACT,
 };
@@ -59,10 +52,9 @@ impl StellarAssetContractTest {
     fn setup(testname: &'static str) -> Self {
         let host = Host::test_host_with_recording_footprint();
         let obs = ObservedHost::new(testname, host.clone());
+        let protocol_version = host.get_ledger_protocol_version().unwrap();
         host.set_ledger_info(LedgerInfo {
-            protocol_version: crate::meta::get_ledger_protocol_version(
-                crate::meta::INTERFACE_VERSION,
-            ),
+            protocol_version,
             sequence_number: 123,
             timestamp: 123456,
             network_id: [5; 32],
@@ -80,7 +72,7 @@ impl StellarAssetContractTest {
             user_key_2: generate_signing_key(&host),
             user_key_3: generate_signing_key(&host),
             user_key_4: generate_signing_key(&host),
-            asset_code: [0_u8; 4],
+            asset_code: [b'a'; 4],
         }
     }
 
@@ -112,7 +104,7 @@ impl StellarAssetContractTest {
             issuer: issuer_id,
         });
 
-        TestStellarAssetContract::new_from_asset(&self.host, asset)
+        TestStellarAssetContract::new_from_asset(&self.host, asset).unwrap()
     }
 
     fn create_default_account(&self, user: &TestSigner) {
@@ -153,10 +145,12 @@ impl StellarAssetContractTest {
 
     fn get_trustline_balance(&self, key: &Rc<LedgerKey>) -> i64 {
         self.host
-            .with_mut_storage(|s| match &s.get(key, self.host.as_budget()).unwrap().data {
-                LedgerEntryData::Trustline(trustline) => Ok(trustline.balance),
-                _ => unreachable!(),
-            })
+            .with_mut_storage(
+                |s| match &s.get_with_host(key, &self.host, None).unwrap().data {
+                    LedgerEntryData::Trustline(trustline) => Ok(trustline.balance),
+                    _ => unreachable!(),
+                },
+            )
             .unwrap()
     }
     #[allow(clippy::too_many_arguments)]
@@ -189,7 +183,7 @@ impl StellarAssetContractTest {
     fn update_account_flags(&self, key: &Rc<LedgerKey>, new_flags: u32) {
         self.host
             .with_mut_storage(|s| {
-                let entry = s.get(key, self.host.as_budget()).unwrap();
+                let entry = s.get_with_host(key, &self.host, None).unwrap();
                 match entry.data.clone() {
                     LedgerEntryData::Account(mut account) => {
                         account.flags = new_flags;
@@ -198,7 +192,7 @@ impl StellarAssetContractTest {
                             &entry,
                             LedgerEntryData::Account(account),
                         )?;
-                        s.put(key, &update, None, self.host.as_budget())
+                        s.put_with_host(key, &update, None, &self.host, None)
                     }
                     _ => unreachable!(),
                 }
@@ -221,12 +215,12 @@ impl StellarAssetContractTest {
             4 => {
                 let mut code = [0_u8; 4];
                 code.copy_from_slice(asset_code);
-                self.host.create_asset_4(code, issuer.clone())
+                self.host.create_tl_asset_4(code, issuer.clone())
             }
             12 => {
                 let mut code = [0_u8; 12];
                 code.copy_from_slice(asset_code);
-                self.host.create_asset_12(code, issuer.clone())
+                self.host.create_tl_asset_12(code, issuer.clone())
             }
             _ => unreachable!(),
         };
@@ -267,7 +261,7 @@ impl StellarAssetContractTest {
     fn update_trustline_flags(&self, key: &Rc<LedgerKey>, new_flags: u32) {
         self.host
             .with_mut_storage(|s| {
-                let entry = s.get(key, self.host.as_budget()).unwrap();
+                let entry = s.get_with_host(key, &self.host, None).unwrap();
                 match entry.data.clone() {
                     LedgerEntryData::Trustline(mut trustline) => {
                         trustline.flags = new_flags;
@@ -276,7 +270,7 @@ impl StellarAssetContractTest {
                             &entry,
                             LedgerEntryData::Trustline(trustline),
                         )?;
-                        s.put(key, &update, None, self.host.as_budget())
+                        s.put_with_host(key, &update, None, &self.host, None)
                     }
                     _ => unreachable!(),
                 }
@@ -348,7 +342,7 @@ fn test_stellar_asset_contract_smart_roundtrip() {
         None,
         0,
     );
-    let contract = TestStellarAssetContract::new_from_asset(&test.host, Asset::Native);
+    let contract = TestStellarAssetContract::new_from_asset(&test.host, Asset::Native).unwrap();
     let expected_stellar_asset_contract_address =
         ScAddress::Contract(test.host.get_asset_contract_id_hash(Asset::Native).unwrap());
 
@@ -374,12 +368,50 @@ fn test_stellar_asset_contract_smart_roundtrip() {
     );
 }
 
+fn create_asset(issuer_id: &AccountId, asset_code: &[u8]) -> Asset {
+    if asset_code.len() == 4 {
+        let mut code = [0_u8; 4];
+        code.clone_from_slice(asset_code);
+        Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(code),
+            issuer: issuer_id.clone(),
+        })
+    } else {
+        let mut code = [0_u8; 12];
+        code.clone_from_slice(asset_code);
+        Asset::CreditAlphanum12(AlphaNum12 {
+            asset_code: AssetCode12(code),
+            issuer: issuer_id.clone(),
+        })
+    }
+}
+
 fn test_asset_init(testname: &'static str, asset_code: &[u8]) {
     let test = StellarAssetContractTest::setup(testname);
+    let issuer_id = signing_key_to_account_id(&test.issuer_key);
+    let asset = create_asset(&issuer_id, asset_code);
+
+    let contract = TestStellarAssetContract::new_from_asset(&test.host, asset.clone()).unwrap();
+    let expected_stellar_asset_contract_address =
+        ScAddress::Contract(test.host.get_asset_contract_id_hash(asset).unwrap());
+    assert_eq!(
+        contract.address.to_sc_address().unwrap(),
+        expected_stellar_asset_contract_address
+    );
+
+    let asset_code_trimmed = String::from_utf8(asset_code.to_vec())
+        .unwrap()
+        .trim_matches(char::from(0))
+        .to_string();
+    assert_eq!(contract.symbol().unwrap().to_string(), asset_code_trimmed);
+
+    assert_eq!(contract.decimals().unwrap(), 7);
+
+    let name = contract.name().unwrap().to_string();
+    let k = ed25519::PublicKey(test.issuer_key.verifying_key().to_bytes());
+    assert_eq!(name, format!("{}:{}", asset_code_trimmed, k.to_string()));
 
     let account_id = signing_key_to_account_id(&test.user_key);
-    let issuer_id = signing_key_to_account_id(&test.issuer_key);
-
     test.create_account(
         &account_id,
         vec![(&test.user_key, 100)],
@@ -400,46 +432,6 @@ fn test_asset_init(testname: &'static str, asset_code: &[u8]) {
         TrustLineFlags::AuthorizedFlag as u32,
         None,
     );
-    let asset = if asset_code.len() == 4 {
-        let mut code = [0_u8; 4];
-        code.clone_from_slice(asset_code);
-        Asset::CreditAlphanum4(AlphaNum4 {
-            asset_code: AssetCode4(code),
-            issuer: issuer_id,
-        })
-    } else {
-        let mut code = [0_u8; 12];
-        code.clone_from_slice(asset_code);
-        Asset::CreditAlphanum12(AlphaNum12 {
-            asset_code: AssetCode12(code),
-            issuer: issuer_id,
-        })
-    };
-    let contract = TestStellarAssetContract::new_from_asset(&test.host, asset.clone());
-    let expected_stellar_asset_contract_address =
-        ScAddress::Contract(test.host.get_asset_contract_id_hash(asset).unwrap());
-    assert_eq!(
-        contract.address.to_sc_address().unwrap(),
-        expected_stellar_asset_contract_address
-    );
-
-    assert_eq!(
-        contract.symbol().unwrap().to_string(),
-        String::from_utf8(asset_code.to_vec()).unwrap()
-    );
-    assert_eq!(contract.decimals().unwrap(), 7);
-    let name = contract.name().unwrap().to_string();
-
-    let mut expected = String::from_utf8(asset_code.to_vec())
-        .unwrap()
-        .trim_matches(char::from(0))
-        .to_string();
-    expected.push(':');
-    let k = ed25519::PublicKey(test.issuer_key.verifying_key().to_bytes());
-    expected.push_str(k.to_string().as_str());
-
-    assert_eq!(name, expected);
-
     let user = TestSigner::account_with_multisig(&account_id, vec![&test.user_key]);
 
     assert_eq!(test.get_trustline_balance(&trustline_key), 10_000_000);
@@ -450,31 +442,56 @@ fn test_asset_init(testname: &'static str, asset_code: &[u8]) {
 }
 
 #[test]
-fn test_asset4_smart_init() {
-    test_asset_init(function_name!(), &[b'z', b'a', b'b', 100]);
+fn test_asset4_init() {
+    test_asset_init(function_name!(), b"zA9Z");
 }
 
 #[test]
-fn test_asset12_smart_init() {
-    test_asset_init(
-        function_name!(),
-        &[
-            65, 76, b'a', b'b', b'a', b'b', b'c', b'a', b'b', b'a', b'b', b'c',
-        ],
-    );
+fn test_asset12_init() {
+    test_asset_init(function_name!(), b"123def456XYZ");
 }
 
 #[test]
-fn test_asset4_smart_leading_zero_init() {
-    test_asset_init(function_name!(), &[b'z', b'a', 0, 0]);
+fn test_asset4_trailing_zero_init() {
+    test_asset_init(function_name!(), b"Az\0\0");
 }
 
 #[test]
-fn test_asset12_smart_leading_zero_init() {
-    test_asset_init(
-        function_name!(),
-        &[65, 76, b'a', b'b', b'a', b'b', b'c', b'a', b'b', b'a', 0, 0],
-    );
+fn test_asset12_trailing_zero_init() {
+    test_asset_init(function_name!(), b"789Az\0\0\0\0\0\0\0");
+}
+
+#[test]
+fn test_do_not_init_contract_for_invalid_asset() {
+    let test = StellarAssetContractTest::setup(function_name!());
+    let issuer_id = signing_key_to_account_id(&test.issuer_key);
+
+    let run_test = |asset_code| {
+        let asset = create_asset(&issuer_id, asset_code);
+        let res = TestStellarAssetContract::new_from_asset(&test.host, asset.clone());
+        assert!(res.is_err());
+        let e = res.err().unwrap();
+        assert!(e.error.is_type(ScErrorType::Value));
+        assert!(e.error.is_code(ScErrorCode::InvalidInput));
+    };
+    // All zero
+    run_test(b"\0\0\0\0");
+    run_test(b"\0\0\0\0\0\0\0\0\0\0\0\0");
+    // Leading zero
+    run_test(b"\0ABC");
+    run_test(b"\0Abc12\0\0\0\0\0\0");
+    // Zero in the middle
+    run_test(b"A\0BC");
+    run_test(b"Abc\012\0\0\0\0\0\0");
+    // Non-alphanumberic character
+    run_test(b"$ABC");
+    run_test(b"A_BC");
+    run_test(b"A\x11\0\0");
+    run_test(b"Abc12!\0\0\0\0\0\0");
+    run_test(b"Abc1 2\0\0\0\0\0\0");
+    run_test(b"Abc1\xff\0\0\0\0\0\0\0");
+    // Too short alphanum-12 asset
+    run_test(b"Abc1\0\0\0\0\0\0\0\0");
 }
 
 #[test]
@@ -731,6 +748,49 @@ fn test_transfer_with_allowance() {
         ),
         ContractError::AllowanceError
     );
+
+    let ledger_num: u32 = test.host.get_ledger_sequence().unwrap().into();
+    contract
+        .approve(&user, user_3.address(&test.host), 10, ledger_num)
+        .unwrap();
+
+    contract
+        .transfer_from(
+            &user_3,
+            user.address(&test.host),
+            user_3.address(&test.host),
+            5,
+        )
+        .unwrap();
+
+    assert_eq!(
+        contract.balance(user.address(&test.host)).unwrap(),
+        89_999_995
+    );
+    assert_eq!(
+        contract.balance(user_3.address(&test.host)).unwrap(),
+        4_000_005
+    );
+
+    // Advance ledger num by one. Allowance should no longer be valid.
+    test.host
+        .with_mut_ledger_info(|li| li.sequence_number = ledger_num + 1)
+        .unwrap();
+
+    assert_eq!(
+        to_contract_err(
+            contract
+                .transfer_from(
+                    &user_3,
+                    user.address(&test.host),
+                    user_3.address(&test.host),
+                    1,
+                )
+                .err()
+                .unwrap()
+        ),
+        ContractError::AllowanceError
+    );
 }
 
 #[test]
@@ -971,7 +1031,7 @@ fn test_burn() {
 #[test]
 fn test_cannot_burn_native() {
     let test = StellarAssetContractTest::setup(function_name!());
-    let contract = TestStellarAssetContract::new_from_asset(&test.host, Asset::Native);
+    let contract = TestStellarAssetContract::new_from_asset(&test.host, Asset::Native).unwrap();
     let user_acc_id = signing_key_to_account_id(&test.user_key);
 
     let user = TestSigner::account_with_multisig(&user_acc_id, vec![&test.user_key]);
@@ -1404,7 +1464,7 @@ fn test_set_admin() {
 #[test]
 fn test_account_balance() {
     let test = StellarAssetContractTest::setup(function_name!());
-    let contract = TestStellarAssetContract::new_from_asset(&test.host, Asset::Native);
+    let contract = TestStellarAssetContract::new_from_asset(&test.host, Asset::Native).unwrap();
     let user_acc_id = signing_key_to_account_id(&test.user_key);
     let user_addr = account_to_address(&test.host, user_acc_id.clone());
 
@@ -2067,7 +2127,7 @@ fn test_classic_account_multisig_auth() {
         None,
         0,
     );
-    let contract = TestStellarAssetContract::new_from_asset(&test.host, Asset::Native);
+    let contract = TestStellarAssetContract::new_from_asset(&test.host, Asset::Native).unwrap();
     let receiver = TestSigner::account(&test.user_key).address(&test.host);
 
     // Success: account weight (60) + 40 = 100
@@ -2237,7 +2297,7 @@ fn test_classic_account_multisig_auth() {
         &test.user_key_3,
         &test.user_key_4,
     ];
-    out_of_order_signers.sort_by_key(|k| k.verifying_key().as_bytes().clone());
+    out_of_order_signers.sort_by_key(|k| *k.verifying_key().as_bytes());
     out_of_order_signers.swap(1, 2);
     assert!(contract
         .transfer(
@@ -2340,7 +2400,7 @@ fn test_stellar_asset_contract_classic_balance_boundaries(
     expected_min_balance: i64,
     expected_max_balance: i64,
 ) {
-    let contract = TestStellarAssetContract::new_from_asset(&test.host, Asset::Native);
+    let contract = TestStellarAssetContract::new_from_asset(&test.host, Asset::Native).unwrap();
 
     let new_balance_key = generate_signing_key(&test.host);
     let new_balance_acc = signing_key_to_account_id(&new_balance_key);
@@ -2658,7 +2718,8 @@ fn test_wrapped_asset_classic_balance_boundaries(
                 test.host.u256_from_account(&issuer_id).unwrap(),
             )),
         }),
-    );
+    )
+    .unwrap();
     // Try to do transfer that would leave balance lower than min.
     assert_eq!(
         to_contract_err(
@@ -2850,7 +2911,8 @@ fn test_classic_transfers_not_possible_for_unauthorized_asset() {
                 test.host.u256_from_account(&issuer_id).unwrap(),
             )),
         }),
-    );
+    )
+    .unwrap();
 
     // Authorized to transfer
     contract
@@ -2881,15 +2943,6 @@ fn test_classic_transfers_not_possible_for_unauthorized_asset() {
 
     // Trustline balance stays the same.
     assert_eq!(test.get_trustline_balance(&trustline_key), 100_000_000);
-}
-
-#[allow(clippy::type_complexity)]
-fn simple_account_sign_fn<'a>(
-    host: &'a Host,
-    kp: &'a SigningKey,
-) -> Box<dyn Fn(&[u8]) -> Val + 'a> {
-    use crate::builtin_contracts::testutils::sign_payload_for_ed25519;
-    Box::new(|payload: &[u8]| -> Val { sign_payload_for_ed25519(host, kp, payload).into() })
 }
 
 #[test]
@@ -2990,7 +3043,7 @@ fn test_custom_account_auth() {
             let key = test.host.contract_instance_ledger_key(&contract_id)?;
             // Note, that this represents 'correct footprint, missing value' scenario.
             // Incorrect footprint scenario is not covered (it's not auth specific).
-            storage.del(&key, test.host.budget_ref())
+            storage.del_with_host(&key, &test.host, None)
         })
         .unwrap();
 
@@ -3142,16 +3195,16 @@ fn test_sac_reentry_is_not_allowed() {
     let issuer_id = signing_key_to_account_id(&test.issuer_key);
     test.create_default_account(&issuer);
     let asset_1 = Asset::CreditAlphanum4(AlphaNum4 {
-        asset_code: AssetCode4([1; 4]),
+        asset_code: AssetCode4([b'c'; 4]),
         issuer: issuer_id.clone(),
     });
     let asset_2 = Asset::CreditAlphanum4(AlphaNum4 {
-        asset_code: AssetCode4([2; 4]),
+        asset_code: AssetCode4([b'Z'; 4]),
         issuer: issuer_id,
     });
 
-    let contract_1 = TestStellarAssetContract::new_from_asset(&test.host, asset_1);
-    let contract_2 = TestStellarAssetContract::new_from_asset(&test.host, asset_2);
+    let contract_1 = TestStellarAssetContract::new_from_asset(&test.host, asset_1).unwrap();
+    let contract_2 = TestStellarAssetContract::new_from_asset(&test.host, asset_2).unwrap();
 
     let account_contract_addr_obj = test
         .host

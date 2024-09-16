@@ -1,18 +1,13 @@
 use std::rc::Rc;
 
-use soroban_env_common::{
-    xdr::{Hash, ScBytes, ScString, ScVal, StringM},
-    Error, Symbol, SymbolSmall,
-};
-
 use crate::{
+    events::{
+        internal::{InternalDiagnosticArg, InternalDiagnosticEvent},
+        InternalEvent, InternalEventsBuffer,
+    },
     host::metered_clone::{MeteredAlloc, MeteredClone, MeteredContainer, MeteredIterator},
-    Host, HostError, Val,
-};
-
-use super::{
-    internal::{InternalDiagnosticArg, InternalDiagnosticEvent},
-    InternalEvent, InternalEventsBuffer,
+    xdr::{Hash, ScBytes, ScString, ScVal, StringM},
+    Error, Host, HostError, Symbol, SymbolSmall, Val,
 };
 
 #[derive(Clone, Default)]
@@ -30,6 +25,11 @@ impl Host {
         args: Vec<InternalDiagnosticArg>,
     ) -> Result<(), HostError> {
         self.with_debug_mode(|| {
+            #[cfg(any(test, feature = "recording_mode"))]
+            if *self.try_borrow_suppress_diagnostic_events()? {
+                return Ok(());
+            }
+
             let de = Rc::metered_new(
                 InternalDiagnosticEvent {
                     contract_id,
@@ -43,7 +43,7 @@ impl Host {
         Ok(())
     }
 
-    pub fn log_diagnostics(&self, msg: &str, args: &[Val]) {
+    pub(crate) fn log_diagnostics(&self, msg: &str, args: &[Val]) {
         self.with_debug_mode(|| {
             let calling_contract = self.get_current_contract_id_opt_internal()?;
             let log_sym = SymbolSmall::try_from_str("log")?;
@@ -67,6 +67,10 @@ impl Host {
         args: &[Val],
     ) {
         self.with_debug_mode(|| {
+            #[cfg(any(test, feature = "recording_mode"))]
+            if *self.try_borrow_suppress_diagnostic_events()? {
+                return Ok(());
+            }
             let error_sym = SymbolSmall::try_from_str("error")?;
             let contract_id = self.get_current_contract_id_opt_internal()?;
             Vec::<InternalDiagnosticArg>::charge_bulk_init_cpy(2, self)?;
@@ -97,10 +101,16 @@ impl Host {
         })
     }
 
-    // Emits an event with topic = ["fn_call", called_contract_id, function_name] and
-    // data = [arg1, args2, ...]
-    // Should called prior to opening a frame for the next call so the calling contract can be inferred correctly
-    pub fn fn_call_diagnostics(&self, called_contract_id: &Hash, func: &Symbol, args: &[Val]) {
+    // Emits an event with topic = ["fn_call", called_contract_id,
+    // function_name] and data = [arg1, args2, ...]. Should called prior to
+    // opening a frame for the next call so the calling contract can be inferred
+    // correctly
+    pub(crate) fn fn_call_diagnostics(
+        &self,
+        called_contract_id: &Hash,
+        func: &Symbol,
+        args: &[Val],
+    ) {
         self.with_debug_mode(|| {
             let calling_contract = self.get_current_contract_id_opt_internal()?;
             Vec::<InternalDiagnosticArg>::charge_bulk_init_cpy(3, self)?;
@@ -121,7 +131,7 @@ impl Host {
 
     // Emits an event with topic = ["fn_return", function_name] and
     // data = [return_val]
-    pub fn fn_return_diagnostics(&self, contract_id: &Hash, func: &Symbol, res: &Val) {
+    pub(crate) fn fn_return_diagnostics(&self, contract_id: &Hash, func: &Symbol, res: &Val) {
         self.with_debug_mode(|| {
             Vec::<InternalDiagnosticArg>::charge_bulk_init_cpy(2, self)?;
             let topics = vec![

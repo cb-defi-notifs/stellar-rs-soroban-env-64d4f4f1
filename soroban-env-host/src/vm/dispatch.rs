@@ -8,11 +8,9 @@ use crate::{
     I64Object, MapObject, StorageType, StringObject, Symbol, SymbolObject, TimepointObject,
     U128Object, U256Object, U256Val, U32Val, U64Object, U64Val, Val, VecObject, Void,
 };
+use core::fmt::Debug;
 use soroban_env_common::{call_macro_with_all_host_functions, WasmiMarshal};
-use wasmi::{
-    core::{Trap, TrapCode::BadSignature},
-    Value,
-};
+use wasmi::{core::TrapCode::BadSignature, Val as Value};
 
 pub(crate) trait RelativeObjectConversion: WasmiMarshal {
     fn absolute_to_relative(self, _host: &Host) -> Result<Self, HostError> {
@@ -21,16 +19,16 @@ pub(crate) trait RelativeObjectConversion: WasmiMarshal {
     fn relative_to_absolute(self, _host: &Host) -> Result<Self, HostError> {
         Ok(self)
     }
-    fn try_marshal_from_relative_value(v: wasmi::Value, host: &Host) -> Result<Self, Trap> {
+    fn try_marshal_from_relative_value(v: wasmi::Val, host: &Host) -> Result<Self, wasmi::Error> {
         let val = Self::try_marshal_from_value(v).ok_or_else(|| {
-            Trap::from(HostError::from(Error::from_type_and_code(
+            HostError::from(Error::from_type_and_code(
                 ScErrorType::Value,
                 ScErrorCode::InvalidInput,
-            )))
+            ))
         })?;
         Ok(val.relative_to_absolute(host)?)
     }
-    fn marshal_relative_from_self(self, host: &Host) -> Result<wasmi::Value, Trap> {
+    fn marshal_relative_from_self(self, host: &Host) -> Result<wasmi::Val, wasmi::Error> {
         let rel = self.absolute_to_relative(host)?;
         Ok(Self::marshal_from_self(rel))
     }
@@ -47,6 +45,43 @@ macro_rules! impl_relative_object_conversion {
                 Ok(Self::try_from(host.relative_to_absolute(self.into())?)?)
             }
         }
+    };
+}
+
+enum TraceArg<T: Debug> {
+    Bad(i64),
+    Ok(T),
+}
+impl<T> Debug for TraceArg<T>
+where
+    T: Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TraceArg::Bad(i) => write!(f, "bad:{:?}", i),
+            TraceArg::Ok(t) => write!(f, "{:?}", t),
+        }
+    }
+}
+
+macro_rules! homogenize_tuple {
+    ($u:ident, ()) => {
+        &[]
+    };
+    ($u:ident, ($_a:expr)) => {
+        &[&$u]
+    };
+    ($u:ident, ($_a:expr, $_b:expr)) => {
+        &[&$u.0, &$u.1]
+    };
+    ($u:ident, ($_a:expr, $_b:expr, $_c:expr)) => {
+        &[&$u.0, &$u.1, &$u.2]
+    };
+    ($u:ident, ($_a:expr, $_b:expr, $_c:expr, $_d:expr)) => {
+        &[&$u.0, &$u.1, &$u.2, &$u.3]
+    };
+    ($u:ident, ($_a:expr, $_b:expr, $_c:expr, $_d:expr, $_e:expr)) => {
+        &[&$u.0, &$u.1, &$u.2, &$u.3, &$u.4]
     };
 }
 
@@ -112,7 +147,7 @@ macro_rules! generate_dispatch_functions {
                     // pattern-repetition matcher so that it will match all such
                     // descriptions.
                     $(#[$fn_attr:meta])*
-                    { $fn_str:literal, fn $fn_id:ident ($($arg:ident:$type:ty),*) -> $ret:ty }
+                    { $fn_str:literal, $($min_proto:literal)?, $($max_proto:literal)?, fn $fn_id:ident ($($arg:ident:$type:ty),*) -> $ret:ty }
                 )*
             }
         )*
@@ -154,55 +189,61 @@ macro_rules! generate_dispatch_functions {
                 // into a set of functions.
                 $(#[$fn_attr])*
                 pub(crate) fn $fn_id(mut caller: wasmi::Caller<Host>, $($arg:i64),*) ->
-                    Result<(i64,), Trap>
+                    Result<(i64,), wasmi::Error>
                 {
                     let _span = tracy_span!(core::stringify!($fn_id));
 
                     let host = caller.data().clone();
 
-                    #[cfg(feature = "testutils")]
+                    // This is an additional protocol version guardrail that
+                    // should not be necessary. Any wasm contract containing a
+                    // call to an out-of-protocol-range host function should
+                    // have been rejected by the linker during VM instantiation.
+                    // This is just an additional guard rail for future proof.
+                    $( host.check_protocol_version_lower_bound($min_proto)?; )?
+                    $( host.check_protocol_version_upper_bound($max_proto)?; )?
+
+                    if host.tracing_enabled()
                     {
-                        host.env_call_hook(&core::stringify!($fn_id), &[$(
-                            // Incoming args might or might-not be type-correct;
-                            // we attempt to unmarshal here but fail safely and
-                            // log the bad i64 if it doesn't work. The failure
-                            // will be repeated below in the attempted call, and
-                            // will propagate.
+                        #[allow(unused)]
+                        let trace_args = ($(
                             match <$type>::try_marshal_from_relative_value(Value::I64($arg), &host) {
-                                Ok(val) => format!("{:?}", val),
-                                Err(_) => format!("bad:{:?}", $arg),
+                                Ok(val) => TraceArg::Ok(val),
+                                Err(_) => TraceArg::Bad($arg),
                             }
-                        ),*])?;
+                        ),*);
+                        let hook_args: &[&dyn std::fmt::Debug] = homogenize_tuple!(trace_args, ($($arg),*));
+                        host.trace_env_call(&core::stringify!($fn_id), hook_args)?;
                     }
 
                     // This is where the VM -> Host boundary is crossed.
                     // We first return all fuels from the VM back to the host such that
                     // the host maintains control of the budget.
-                    FuelRefillable::return_fuel_to_host(&mut caller, &host).map_err(|he| Trap::from(he))?;
+                    FuelRefillable::return_fuel_to_host(&mut caller, &host)?;
 
                     // Charge for the host function dispatching: conversion between VM fuel and
                     // host budget, marshalling values. This does not account for the actual work
                     // being done in those functions, which are metered individually by the implementation.
                     host.charge_budget(ContractCostType::DispatchHostFunction, None)?;
                     let mut vmcaller = VmCaller(Some(caller));
-                    // The odd / seemingly-redundant use of `wasmi::Value` here
+                    // The odd / seemingly-redundant use of `wasmi::Val` here
                     // as intermediates -- rather than just passing Vals --
                     // has to do with the fact that some host functions are
                     // typed as receiving or returning plain _non-val_ i64 or
                     // u64 values. So the call here has to be able to massage
-                    // both types into and out of i64, and `wasmi::Value`
+                    // both types into and out of i64, and `wasmi::Val`
                     // happens to be a natural switching point for that: we have
                     // conversions to and from both Val and i64 / u64 for
-                    // wasmi::Value.
+                    // wasmi::Val.
                     let res: Result<_, HostError> = host.$fn_id(&mut vmcaller, $(<$type>::check_env_arg(<$type>::try_marshal_from_relative_value(Value::I64($arg), &host)?, &host)?),*);
 
-                    #[cfg(feature = "testutils")]
+                    if host.tracing_enabled()
                     {
-                        let res_str: Result<String,&HostError> = match &res {
-                            Ok(ok) => Ok(format!("{:?}", ok)),
+                        let dyn_res: Result<&dyn core::fmt::Debug,&HostError> = match &res {
+                            Ok(ref ok) => Ok(ok),
                             Err(err) => Err(err)
                         };
-                        host.env_ret_hook(&core::stringify!($fn_id), &res_str)?;
+                        host.trace_env_ret(&core::stringify!($fn_id), &dyn_res)?;
                     }
 
                     // On the off chance we got an error with no context, we can
@@ -227,15 +268,15 @@ macro_rules! generate_dispatch_functions {
                                 host.error(hosterr.error,
                                            concat!("escalating error to VM trap from failed host function call: ",
                                                    stringify!($fn_id)), &[]);
-                            let trap: Trap = escalation.into();
-                            Err(trap)
+                            let we: wasmi::Error = escalation.into();
+                            Err(we)
                         }
                     };
 
                     // This is where the Host->VM boundary is crossed.
                     // We supply the remaining host budget as fuel to the VM.
-                    let caller = vmcaller.try_mut().map_err(|e| Trap::from(HostError::from(e)))?;
-                    FuelRefillable::add_fuel_to_vm(caller, &host).map_err(|he| Trap::from(he))?;
+                    let caller = vmcaller.try_mut().map_err(|e| HostError::from(e))?;
+                    FuelRefillable::add_fuel_to_vm(caller, &host)?;
 
                     res
                 }

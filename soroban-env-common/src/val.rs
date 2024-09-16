@@ -9,7 +9,7 @@ use crate::{
 };
 
 use super::{Env, Error, TryFromVal};
-use core::{cmp::Ordering, convert::Infallible, fmt::Debug};
+use core::{cmp::Ordering, convert::Infallible, fmt::Debug, str};
 
 extern crate static_assertions as sa;
 
@@ -404,14 +404,14 @@ impl_tryfroms_and_tryfromvals_delegating_to_valconvert!(Error);
 
 #[cfg(feature = "wasmi")]
 pub trait WasmiMarshal: Sized {
-    fn try_marshal_from_value(v: wasmi::Value) -> Option<Self>;
-    fn marshal_from_self(self) -> wasmi::Value;
+    fn try_marshal_from_value(v: wasmi::Val) -> Option<Self>;
+    fn marshal_from_self(self) -> wasmi::Val;
 }
 
 #[cfg(feature = "wasmi")]
 impl WasmiMarshal for Val {
-    fn try_marshal_from_value(v: wasmi::Value) -> Option<Self> {
-        if let wasmi::Value::I64(i) = v {
+    fn try_marshal_from_value(v: wasmi::Val) -> Option<Self> {
+        if let wasmi::Val::I64(i) = v {
             let v = Val::from_payload(i as u64);
             if v.is_good() {
                 Some(v)
@@ -423,38 +423,38 @@ impl WasmiMarshal for Val {
         }
     }
 
-    fn marshal_from_self(self) -> wasmi::Value {
-        wasmi::Value::I64(self.get_payload() as i64)
+    fn marshal_from_self(self) -> wasmi::Val {
+        wasmi::Val::I64(self.get_payload() as i64)
     }
 }
 
 #[cfg(feature = "wasmi")]
 impl WasmiMarshal for u64 {
-    fn try_marshal_from_value(v: wasmi::Value) -> Option<Self> {
-        if let wasmi::Value::I64(i) = v {
+    fn try_marshal_from_value(v: wasmi::Val) -> Option<Self> {
+        if let wasmi::Val::I64(i) = v {
             Some(i as u64)
         } else {
             None
         }
     }
 
-    fn marshal_from_self(self) -> wasmi::Value {
-        wasmi::Value::I64(self as i64)
+    fn marshal_from_self(self) -> wasmi::Val {
+        wasmi::Val::I64(self as i64)
     }
 }
 
 #[cfg(feature = "wasmi")]
 impl WasmiMarshal for i64 {
-    fn try_marshal_from_value(v: wasmi::Value) -> Option<Self> {
-        if let wasmi::Value::I64(i) = v {
+    fn try_marshal_from_value(v: wasmi::Val) -> Option<Self> {
+        if let wasmi::Val::I64(i) = v {
             Some(i)
         } else {
             None
         }
     }
 
-    fn marshal_from_self(self) -> wasmi::Value {
-        wasmi::Value::I64(self)
+    fn marshal_from_self(self) -> wasmi::Val {
+        wasmi::Val::I64(self)
     }
 }
 
@@ -609,17 +609,34 @@ impl Val {
         }
     }
 
-    pub fn can_represent_scval(scv: &crate::xdr::ScVal) -> bool {
+    /// *Non-recursively* checks whether `ScVal` can be represented as `Val`.
+    /// Since conversions from `ScVal` are recursive themselves, this should
+    /// be called at every recursion level during conversion.
+    pub fn can_represent_scval(scv: &ScVal) -> bool {
+        match scv {
+            // Map/vec can't be validated just based on the discriminant,
+            // as their contents can't be `None`.
+            ScVal::Vec(None) => return false,
+            ScVal::Map(None) => return false,
+            _ => Self::can_represent_scval_type(scv.discriminant()),
+        }
+    }
+
+    /// *Recursively* checks whether `ScVal` can be represented as `Val`.
+    /// This should only be used once per top-level `ScVal`.
+    pub fn can_represent_scval_recursive(scv: &ScVal) -> bool {
         match scv {
             // Handle recursive types first
             ScVal::Vec(None) => return false,
             ScVal::Map(None) => return false,
-            ScVal::Vec(Some(v)) => return v.0.iter().all(|x| Val::can_represent_scval(x)),
+            ScVal::Vec(Some(v)) => {
+                return v.0.iter().all(|x| Val::can_represent_scval_recursive(x))
+            }
             ScVal::Map(Some(m)) => {
-                return m
-                    .0
-                    .iter()
-                    .all(|e| Val::can_represent_scval(&e.key) && Val::can_represent_scval(&e.val))
+                return m.0.iter().all(|e| {
+                    Val::can_represent_scval_recursive(&e.key)
+                        && Val::can_represent_scval_recursive(&e.val)
+                })
             }
             _ => Self::can_represent_scval_type(scv.discriminant()),
         }
@@ -820,8 +837,12 @@ impl Debug for Val {
             Tag::SymbolSmall => {
                 let ss: SymbolStr =
                     unsafe { <SymbolSmall as ValConvert>::unchecked_from_val(*self) }.into();
+                // Even though this may be called for an arbitrary, not necessarily well-formed
+                // `Val`, this is still safe thanks to `SymbolSmall` iteration implementation that
+                // only returns valid symbol characters or `\0` even for invalid bit
+                // representations.
                 let s: &str = ss.as_ref();
-                write!(f, "Symbol({s})")
+                write!(f, "Symbol({})", s)
             }
 
             Tag::U64Object => fmt_obj("U64", self, f),

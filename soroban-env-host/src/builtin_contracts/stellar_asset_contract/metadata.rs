@@ -1,22 +1,19 @@
-use std::fmt::Write;
-
-use soroban_builtin_sdk_macros::contracttype;
-use stellar_strkey::ed25519;
-
-use crate::{builtin_contracts::base_types::BytesN, host::Host, HostError};
-use soroban_env_common::{
-    ConversionError, Env, EnvBase, StorageType, SymbolSmall, TryFromVal, TryIntoVal,
-};
-
-use crate::builtin_contracts::base_types::String;
-
 use super::{asset_info::read_asset_info, public_types::AssetInfo};
+use crate::{
+    builtin_contracts::base_types::{BytesN, String},
+    host::Host,
+    xdr::{ScErrorCode, ScErrorType},
+    Env, EnvBase, HostError, StorageType, SymbolSmall, TryFromVal, TryIntoVal,
+};
+use soroban_builtin_sdk_macros::contracttype;
+use std::fmt::Write;
+use stellar_strkey::ed25519;
 
 const METADATA_KEY: &str = "METADATA";
 
 #[derive(Clone)]
 #[contracttype]
-pub struct StellarAssetContractMetadata {
+pub(crate) struct StellarAssetContractMetadata {
     pub decimal: u32,
     pub name: String,
     pub symbol: String,
@@ -24,14 +21,18 @@ pub struct StellarAssetContractMetadata {
 
 pub const DECIMAL: u32 = 7;
 
-// This does a specific and fairly unique escaping transformation as defined
-// in TxRep / SEP-0011.
-fn render_sep0011_asset_code(
-    buf: &[u8],
-    out: &mut std::string::String,
-) -> Result<(), ConversionError> {
+// This does a specific and fairly unique escaping transformation as defined in
+// TxRep / SEP-0011.
+//
+// Note: this seemed appropriate when it was initially added but is really
+// overkill, since all asset codes admitted to the system are validated to be
+// ASCII alphanumeric, with only trailing zeroes and only unambiguous
+// zero-padded lengths, over in [`validate_asset`]; but we reproduce the
+// escaping logic in SEP-0011 here anyway to add some defense in depth, in case
+// validation was somehow missed.
+fn render_sep0011_asset_code(buf: &[u8], out: &mut std::string::String) -> Result<(), HostError> {
     if buf.len() != 4 && buf.len() != 12 {
-        return Err(ConversionError);
+        return Err((ScErrorType::Value, ScErrorCode::InvalidInput).into());
     }
     for (i, x) in buf.iter().enumerate() {
         match *x {
@@ -41,9 +42,8 @@ fn render_sep0011_asset_code(
             // as \x00 until past the 5th byte, so that the result is
             // unambiguously different than a 4-byte code.
             0 if buf.len() == 12 && i > 4 => break,
-            b':' | b'\\' | 0..=0x20 | 0x7f..=0xff => {
-                write!(out, r"\x{:02x}", x).map_err(|_| ConversionError)?
-            }
+            b':' | b'\\' | 0..=0x20 | 0x7f..=0xff => write!(out, r"\x{:02x}", x)
+                .map_err(|_| HostError::from((ScErrorType::Value, ScErrorCode::InvalidInput)))?,
             _ => out.push(*x as char),
         }
     }
@@ -136,27 +136,34 @@ fn render_sep0011_asset<const N: usize>(
     let strkey_len = 56;
 
     // Biggest resulting string has each byte escaped to 4 bytes.
-    let capacity = symbuf.len() * 4 + 1 + strkey_len;
+    let capacity = symbuf
+        .len()
+        .saturating_mul(4)
+        .saturating_add(1)
+        .saturating_add(strkey_len);
 
     // We also have to charge for strkey_len again since PublicKey::to_string does
     // a std::string::String allocation of its own.
-    let charge = capacity + strkey_len;
+    let charge = capacity.saturating_add(strkey_len);
     e.charge_budget(crate::xdr::ContractCostType::MemAlloc, Some(charge as u64))?;
 
     let mut s: std::string::String = std::string::String::with_capacity(capacity);
     render_sep0011_asset_code(&symbuf, &mut s)?;
+
+    // Use the sep-11 (trimmed and/or escaped) asset code we just rendered for the metadata symbol.
+    let symbol = String::try_from_val(e, &e.string_new_from_slice(s.as_bytes())?)?;
+
+    // Then follow it with a colon and the issuer's strkey for the metadata name.
     s.push(':');
     s.push_str(&ed25519::PublicKey(issuer.to_array()?).to_string());
-    Ok((
-        String::try_from_val(e, &e.string_new_from_slice(s.as_str())?)?,
-        symbol,
-    ))
+    let name = String::try_from_val(e, &e.string_new_from_slice(s.as_bytes())?)?;
+    Ok((name, symbol))
 }
 
-pub fn set_metadata(e: &Host) -> Result<(), HostError> {
+pub(crate) fn set_metadata(e: &Host) -> Result<(), HostError> {
     let name_and_symbol: (String, String) = match read_asset_info(e)? {
         AssetInfo::Native => {
-            let n = String::try_from_val(e, &e.string_new_from_slice("native")?)?;
+            let n = String::try_from_val(e, &e.string_new_from_slice(b"native")?)?;
             (n.clone(), n)
         }
         AssetInfo::AlphaNum4(asset) => {
@@ -182,7 +189,7 @@ pub fn set_metadata(e: &Host) -> Result<(), HostError> {
     Ok(())
 }
 
-pub fn read_name(e: &Host) -> Result<String, HostError> {
+pub(crate) fn read_name(e: &Host) -> Result<String, HostError> {
     let key = SymbolSmall::try_from_str(METADATA_KEY)?;
     let metadata: StellarAssetContractMetadata = e
         .get_contract_data(key.try_into_val(e)?, StorageType::Instance)?
@@ -190,7 +197,7 @@ pub fn read_name(e: &Host) -> Result<String, HostError> {
     Ok(metadata.name)
 }
 
-pub fn read_symbol(e: &Host) -> Result<String, HostError> {
+pub(crate) fn read_symbol(e: &Host) -> Result<String, HostError> {
     let key = SymbolSmall::try_from_str(METADATA_KEY)?;
     let metadata: StellarAssetContractMetadata = e
         .get_contract_data(key.try_into_val(e)?, StorageType::Instance)?

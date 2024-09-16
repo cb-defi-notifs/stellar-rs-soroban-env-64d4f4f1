@@ -1,14 +1,14 @@
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, SeedableRng};
 use soroban_bench_utils::{tracking_allocator::AllocationGroupToken, HostTracker};
 use soroban_env_host::{
-    budget::{AsBudget, COST_MODEL_LIN_TERM_SCALE_BITS},
+    budget::{AsBudget, CostTracker, MeteredCostComponent},
     cost_runner::{CostRunner, CostType},
     Host,
 };
 use std::{io, ops::Range};
 use tabwriter::{Alignment, TabWriter};
 
-use super::{fit_model, FPCostModel};
+use super::modelfit::fit_model;
 
 #[derive(Clone, Debug, Default)]
 pub struct Measurement {
@@ -68,10 +68,11 @@ impl Measurements {
             .iter()
             .map(|m| {
                 let mut e = m.clone();
-                e.inputs = e.inputs.map(|i| i / e.iterations);
-                e.cpu_insns = e.cpu_insns.saturating_sub(self.baseline.cpu_insns) / e.iterations;
-                e.mem_bytes = e.mem_bytes.saturating_sub(self.baseline.mem_bytes) / e.iterations;
-                e.time_nsecs = e.time_nsecs.saturating_sub(self.baseline.time_nsecs) / e.iterations;
+                let iterations = e.iterations.max(1);
+                e.inputs = e.inputs.map(|i| i / iterations);
+                e.cpu_insns = e.cpu_insns.saturating_sub(self.baseline.cpu_insns) / iterations;
+                e.mem_bytes = e.mem_bytes.saturating_sub(self.baseline.mem_bytes) / iterations;
+                e.time_nsecs = e.time_nsecs.saturating_sub(self.baseline.time_nsecs) / iterations;
                 e
             })
             .collect()
@@ -81,15 +82,22 @@ impl Measurements {
     where
         F: Fn(&Measurement) -> u64,
     {
+        // data must be preprocessed
+        assert_eq!(
+            self.measurements.len(),
+            self.averaged_net_measurements.len()
+        );
+
         use thousands::Separable;
         let points: Vec<(f32, f32)> = self
-            .measurements
+            .averaged_net_measurements
             .iter()
             .enumerate()
             .map(|(i, m)| (i as f32, get_output(m) as f32))
             .collect();
         let ymin = points.iter().map(|(_, y)| *y).reduce(f32::min).unwrap();
         let ymax = points.iter().map(|(_, y)| *y).reduce(f32::max).unwrap();
+        let ymean = points.iter().map(|(_, y)| *y).sum::<f32>() / points.len().max(1) as f32;
 
         if ymin == ymax {
             return;
@@ -97,13 +105,13 @@ impl Measurements {
         let hist = textplots::utils::histogram(&points, ymin, ymax, 30);
 
         let in_min = self
-            .measurements
+            .averaged_net_measurements
             .iter()
             .map(|m| m.inputs.unwrap_or(0) as f32)
             .reduce(f32::min)
             .unwrap();
         let in_max = self
-            .measurements
+            .averaged_net_measurements
             .iter()
             .map(|m| m.inputs.unwrap_or(0) as f32)
             .reduce(f32::max)
@@ -117,11 +125,13 @@ impl Measurements {
             in_max / in_min.max(1.0)
         );
         println!(
-            "{} output: min {}; max {}; max/min = {}",
+            "{} output: min {}; max {}; max/min = {}; mean = {}; count = {}",
             out_name,
             ymin.separate_with_commas(),
             ymax.separate_with_commas(),
-            ymax / ymin.max(1.0)
+            ymax / ymin.max(1.0),
+            ymean.separate_with_commas(),
+            points.len()
         );
         Chart::new(180, 60, ymin - 100.0, ymax + 100.0)
             .lineplot(&Shape::Bars(&hist))
@@ -171,7 +181,7 @@ impl Measurements {
         eprintln!("{}", String::from_utf8(tw.into_inner().unwrap()).unwrap());
     }
 
-    pub fn fit_model_to_cpu(&self) -> FPCostModel {
+    pub fn fit_model_to_cpu(&self) -> (MeteredCostComponent, f64) {
         // data must be preprocessed
         assert_eq!(
             self.measurements.len(),
@@ -181,20 +191,15 @@ impl Measurements {
         let (x, y): (Vec<_>, Vec<_>) = self
             .averaged_net_measurements
             .iter()
-            .map(|m| {
-                (
-                    // we've made sure the raw inputs have been conflated before via HCM::STEP_SIZE,
-                    // here we can safely scale it back
-                    m.inputs.unwrap_or(0) >> COST_MODEL_LIN_TERM_SCALE_BITS,
-                    m.cpu_insns,
-                )
-            })
+            .map(|m| (m.inputs.unwrap_or(0), m.cpu_insns))
             .unzip();
 
-        fit_model(x, y)
+        let model = fit_model(x, y);
+        let r2 = model.r_squared;
+        (model.into(), r2)
     }
 
-    pub fn fit_model_to_mem(&self) -> FPCostModel {
+    pub fn fit_model_to_mem(&self) -> (MeteredCostComponent, f64) {
         // data must be preprocessed
         assert_eq!(
             self.measurements.len(),
@@ -204,17 +209,12 @@ impl Measurements {
         let (x, y): (Vec<_>, Vec<_>) = self
             .averaged_net_measurements
             .iter()
-            .map(|m| {
-                (
-                    // we've made sure the raw inputs have been conflated before via HCM::STEP_SIZE,
-                    // here we can safely scale it back
-                    m.inputs.unwrap_or(0) >> COST_MODEL_LIN_TERM_SCALE_BITS,
-                    m.mem_bytes,
-                )
-            })
+            .map(|m| (m.inputs.unwrap_or(0), m.mem_bytes))
             .unzip();
 
-        fit_model(x, y)
+        let model = fit_model(x, y);
+        let r2 = model.r_squared;
+        (model.into(), r2)
     }
 }
 
@@ -252,15 +252,16 @@ pub trait HostCostMeasurement: Sized {
     /// The type of host runner we're using. Uniquely identifies a `CostType`.
     type Runner: CostRunner;
 
-    /// The `input: u64` will be multiplied by the `STEP_SIZE` for two reasons:
-    /// 1. for fast-running linear components, setting the step size larger can
-    /// ensure each sample runs for longer (compared to measurement fluctuation),
-    /// thus helps extrapolating the linear coefficient.
-    /// 2. when fitting the linear model, the linear coefficient will be scaled
-    /// up by `factor = 2^COST_MODEL_LIN_TERM_SCALE_BITS`, by scaling down the
-    /// actual input size. Thus `STEP_SIZE` must be `>= factor` to account for
-    /// the input downscaling.
+    /// The `input: u64` will be multiplied by the `STEP_SIZE`. It exist mainly
+    /// numerical reasons, for fast-running linear components, setting the step
+    /// size larger can ensure each sample runs for longer (compared to
+    /// measurement fluctuation), thus helps deriving a more accurate linear
+    /// coefficient (slope). This is not relevant for const models.
     const STEP_SIZE: u64 = 1024;
+
+    /// Base size of the HCM input, which does not necessary have the same unit
+    /// as the input to the budget.
+    const INPUT_BASE_SIZE: u64 = 1;
 
     /// Initialize a new instance of a HostMeasurement at a given input _hint_, for
     /// the run; the HostMeasurement can choose a precise input for a given hint
@@ -315,7 +316,7 @@ pub trait HostCostMeasurement: Sized {
         <Self::Runner as CostRunner>::run(host, samples, recycled_samples)
     }
 
-    fn get_tracker(host: &Host) -> (u64, Option<u64>) {
+    fn get_tracker(host: &Host) -> CostTracker {
         <Self::Runner as CostRunner>::get_tracker(host)
     }
 
@@ -348,7 +349,6 @@ where
         &mut Vec<<<HCM as HostCostMeasurement>::Runner as CostRunner>::RecycledType>,
     ),
 {
-    assert!(HCM::STEP_SIZE >= (1 << COST_MODEL_LIN_TERM_SCALE_BITS));
     let mut recycled_samples = Vec::with_capacity(samples.len());
     host.as_budget().reset_unlimited().unwrap();
 
@@ -361,10 +361,10 @@ where
 
     // Note: the `iterations` here is not same as `RUN_ITERATIONS`. This is the `N` part of the
     // cost model, which is `RUN_ITERATIONS` * "model iterations from the sample"
-    let (iterations, inputs) = HCM::get_tracker(&host);
+    let ct = HCM::get_tracker(&host);
     Measurement {
-        iterations,
-        inputs,
+        iterations: ct.iterations,
+        inputs: ct.inputs,
         cpu_insns,
         mem_bytes,
         time_nsecs,
@@ -451,19 +451,20 @@ pub fn measure_worst_case_costs<HCM: HostCostMeasurement>(
     })
 }
 
-/// Measure the cost variation of a HCM. `sweep_input` specifies whether the input
-/// is fixed or randomized.
-///     if true - input is randomized, with `large_input` specifying the upperbound
-///               of the input size
-///     if false - input size is fixed at `large_input`
-/// `iteration` specifies number of iterations to run the measurement
-/// `include_best_case` specifies whether best case is included. Often the best case
-/// is a trivial case that isn't too relevant (and never hit). So if one is more
-/// interested in the worst/average analysis, it might be useful to throw it away.
+/// Measure the cost variation of a HCM.
+///
+/// - `iteration` specifies number of iterations to run the measurement for
+/// - `get_rand_input` is called to generate an input for the `new_random_case`
+///   at each iteration
+/// - `get_worst_input` gets the input corresponding to the `new_worst_case`
+/// - `include_best_case` specifies whether best case is included. Often the
+/// best case is a trivial case that isn't too relevant (and never hit). So if
+/// one is more interested in the worst/average analysis, set this to `false`.
+
 pub fn measure_cost_variation<HCM: HostCostMeasurement>(
-    large_input: u64,
     iterations: u64,
-    sweep_input: bool,
+    get_rand_input: fn() -> u64,
+    get_worst_input: fn() -> u64,
     include_best_case: bool,
 ) -> Result<Measurements, std::io::Error> {
     let mut i = 0;
@@ -487,21 +488,18 @@ pub fn measure_cost_variation<HCM: HostCostMeasurement>(
     let measurements = measure_costs_inner::<HCM, _, _>(
         |host| {
             i += 1;
-            let input = if sweep_input {
-                rng.gen_range(1..=2 + large_input)
-            } else {
-                large_input
-            };
             match i {
                 1 => {
                     if include_best_case {
                         Some(HCM::new_best_case(host, &mut rng))
                     } else {
-                        Some(HCM::new_random_case(host, &mut rng, input))
+                        Some(HCM::new_random_case(host, &mut rng, get_rand_input()))
                     }
                 }
-                2 => Some(HCM::new_worst_case(host, &mut rng, large_input)),
-                n if n < iterations => Some(HCM::new_random_case(host, &mut rng, input)),
+                2 => Some(HCM::new_worst_case(host, &mut rng, get_worst_input())),
+                n if n <= iterations => {
+                    Some(HCM::new_random_case(host, &mut rng, get_rand_input()))
+                }
                 _ => None,
             }
         },

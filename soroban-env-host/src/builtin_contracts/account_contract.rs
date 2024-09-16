@@ -1,56 +1,69 @@
-use crate::auth::{AuthorizedFunction, AuthorizedInvocation};
 // This is a built-in account 'contract'. This is not actually a contract, as
 // it doesn't need to be directly invoked. But semantically this is analagous
 // to a generic smart wallet contract that supports authentication and blanket
 // context authorization.
-use crate::builtin_contracts::{base_types::BytesN, contract_error::ContractError};
-use crate::host::{frame::ContractReentryMode, Host};
-use crate::{err, HostError};
-use core::cmp::Ordering;
-use soroban_env_common::xdr::{
-    self, ContractIdPreimage, Hash, ScErrorCode, ScErrorType, ThresholdIndexes, Uint256,
+use crate::{
+    auth::{AuthorizedFunction, AuthorizedInvocation},
+    builtin_contracts::{
+        base_types::{Address, BytesN, Vec as HostVec},
+        common_types::ContractExecutable,
+        contract_error::ContractError,
+    },
+    err,
+    host::{
+        frame::{CallParams, ContractReentryMode},
+        Host,
+    },
+    xdr::{
+        self, AccountId, ContractIdPreimage, Hash, ScErrorCode, ScErrorType, ThresholdIndexes,
+        Uint256,
+    },
+    Env, EnvBase, HostError, Symbol, TryFromVal, TryIntoVal, Val,
 };
-use soroban_env_common::{Env, EnvBase, Symbol, TryFromVal, TryIntoVal, Val};
-
-use crate::builtin_contracts::base_types::Vec as HostVec;
+use core::cmp::Ordering;
 
 const MAX_ACCOUNT_SIGNATURES: u32 = 20;
 
 use soroban_builtin_sdk_macros::contracttype;
-use soroban_env_common::xdr::AccountId;
-
-use super::base_types::Address;
-use super::common_types::ContractExecutable;
 
 pub const ACCOUNT_CONTRACT_CHECK_AUTH_FN_NAME: &str = "__check_auth";
 
 #[derive(Clone)]
 #[contracttype]
-pub struct ContractAuthorizationContext {
-    pub contract: Address,
-    pub fn_name: Symbol,
-    pub args: HostVec,
+pub(crate) struct ContractAuthorizationContext {
+    pub(crate) contract: Address,
+    pub(crate) fn_name: Symbol,
+    pub(crate) args: HostVec,
 }
 
 #[derive(Clone)]
 #[contracttype]
-pub struct CreateContractHostFnContext {
-    pub executable: ContractExecutable,
-    pub salt: BytesN<32>,
+pub(crate) struct CreateContractHostFnContext {
+    pub(crate) executable: ContractExecutable,
+    pub(crate) salt: BytesN<32>,
 }
 
 #[derive(Clone)]
 #[contracttype]
-enum AuthorizationContext {
+pub(crate) struct CreateContractWithConstructorHostFnContext {
+    pub(crate) executable: ContractExecutable,
+    pub(crate) salt: BytesN<32>,
+    pub(crate) constructor_args: HostVec,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub(crate) enum AuthorizationContext {
     Contract(ContractAuthorizationContext),
     CreateContractHostFn(CreateContractHostFnContext),
+    CreateContractWithCtorHostFn(CreateContractWithConstructorHostFnContext),
 }
 
 #[derive(Clone)]
 #[contracttype]
-pub struct AccountEd25519Signature {
-    pub public_key: BytesN<32>,
-    pub signature: BytesN<64>,
+pub(crate) struct AccountEd25519Signature {
+    pub(crate) public_key: BytesN<32>,
+    pub(crate) signature: BytesN<64>,
 }
 
 impl AuthorizationContext {
@@ -89,12 +102,23 @@ impl AuthorizationContext {
                         &[],
                     )),
                 };
-                Ok(AuthorizationContext::CreateContractHostFn(
-                    CreateContractHostFnContext {
-                        executable: ContractExecutable::Wasm(wasm_hash),
-                        salt,
-                    },
-                ))
+                if args.constructor_args.is_empty() {
+                    Ok(AuthorizationContext::CreateContractHostFn(
+                        CreateContractHostFnContext {
+                            executable: ContractExecutable::Wasm(wasm_hash),
+                            salt,
+                        },
+                    ))
+                } else {
+                    let args_vec = host.scvals_to_val_vec(&args.constructor_args.as_slice())?;
+                    Ok(AuthorizationContext::CreateContractWithCtorHostFn(
+                        CreateContractWithConstructorHostFnContext {
+                            executable: ContractExecutable::Wasm(wasm_hash),
+                            salt,
+                            constructor_args: args_vec.try_into_val(host)?,
+                        },
+                    ))
+                }
             }
         }
     }
@@ -132,10 +156,13 @@ pub(crate) fn check_account_contract_auth(
             account_contract,
             ACCOUNT_CONTRACT_CHECK_AUTH_FN_NAME.try_into_val(host)?,
             &[payload_obj.into(), signature, auth_context_vec.into()],
-            // Allow self reentry for this function in order to be able to do
-            // wallet admin ops using the auth framework itself.
-            ContractReentryMode::SelfAllowed,
-            true,
+            CallParams {
+                // Allow self reentry for this function in order to be able to do
+                // wallet admin ops using the auth framework itself.
+                reentry_mode: ContractReentryMode::SelfAllowed,
+                internal_host_call: true,
+                treat_missing_function_as_noop: false,
+            },
         )?
         .try_into()?)
 }
@@ -157,6 +184,13 @@ pub(crate) fn check_account_authentication(
             ContractError::AuthenticationError,
             "too many account signers",
             len
+        ));
+    }
+    if len == 0 {
+        return Err(host.error(
+            ContractError::AuthenticationError.into(),
+            "no account signatures found",
+            &[],
         ));
     }
     let payload_obj = host.bytes_new_from_slice(payload)?;

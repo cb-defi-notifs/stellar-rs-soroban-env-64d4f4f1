@@ -135,8 +135,8 @@ fn call_indirect() {
     fe.push(Symbol::try_from_small_str("fail").unwrap());
     let (mut me, f2) = fe.finish();
     // store in table
-    me.define_elems(&[f0, f1, f2]);
-    let ty = me.get_fn_type(Arity(0));
+    me.define_elem_funcs(&[f0, f1, f2]);
+    let ty = me.get_fn_type(Arity(0), Arity(1));
     // the caller
     fe = me.func(Arity(1), 0);
     fe.push(Operand::Const32(1));

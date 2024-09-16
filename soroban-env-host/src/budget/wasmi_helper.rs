@@ -1,60 +1,18 @@
-use super::AsBudget;
-use crate::{xdr::ContractCostType, Host};
-use wasmi::{errors, ResourceLimiter};
-
-/// This is a subset of `wasmi::FuelCosts` which are configurable, because it
-/// doesn't derive all the traits we want. These fields (coarsely) define the
-/// relative costs of different wasm instruction types and are for wasmi internal
-/// fuel metering use only. Units are in "fuels".
-#[derive(Clone)]
-pub(crate) struct FuelConfig {
-    /// The base fuel costs for all instructions.
-    pub base: u64,
-    /// The fuel cost for instruction operating on Wasm entities.
-    ///
-    /// # Note
-    ///
-    /// A Wasm entitiy is one of `func`, `global`, `memory` or `table`.
-    /// Those instructions are usually a bit more costly since they need
-    /// multiplie indirect accesses through the Wasm instance and store.
-    pub entity: u64,
-    /// The fuel cost offset for `memory.load` instructions.
-    pub load: u64,
-    /// The fuel cost offset for `memory.store` instructions.
-    pub store: u64,
-    /// The fuel cost offset for `call` and `call_indirect` instructions.
-    pub call: u64,
-}
-
-// These values are calibrated and set by us.
-impl Default for FuelConfig {
-    fn default() -> Self {
-        FuelConfig {
-            base: 1,
-            entity: 3,
-            load: 2,
-            store: 1,
-            call: 67,
-        }
-    }
-}
-
-impl FuelConfig {
-    // These values are the "factory default" and used for calibration.
-    #[cfg(any(test, feature = "testutils", feature = "bench"))]
-    pub(crate) fn reset(&mut self) {
-        self.base = 1;
-        self.entity = 1;
-        self.load = 1;
-        self.store = 1;
-        self.call = 1;
-    }
-}
+use crate::{
+    budget::{AsBudget, Budget},
+    host::error::TryBorrowOrErr,
+    xdr::ContractCostType,
+    Host, HostError,
+};
+use wasmi::{errors, CompilationMode, EnforcedLimits, FuelCosts, ResourceLimiter};
 
 pub(crate) struct WasmiLimits {
     pub table_elements: u32,
     pub instances: usize,
+    // The `tables` limit is only relevant if `wasmi_reference_type` is enabled
     pub tables: usize,
+    // The `memories` limit is irrelevant. At the current version of WASM, at
+    // most one memory may be defined or imported in a single module
     pub memories: usize,
 }
 
@@ -140,4 +98,70 @@ impl ResourceLimiter for Host {
     fn memories(&self) -> usize {
         WASMI_LIMITS_CONFIG.memories
     }
+}
+
+pub(crate) fn load_calibrated_fuel_costs() -> FuelCosts {
+    let fuel_costs = FuelCosts::default();
+    // Wasmi 0.36 has a simplified fuel-cost schedule, based on its new
+    // register-machine architecture. It is simply this: 1 fuel per wasm
+    // instruction, and each fuel represents moving 8 registers or 64 bytes.
+    //
+    // All this is hard-wired now (see FuelCosts::default) and it seems broadly
+    // _correct_ in terms of the actual runtime costs we see in wasmi: it costs
+    // _about_ 8-16 CPU instructions per fuel when we look at instructions we
+    // can even calibrate, and wasmi's own benchmarks suggest it runs about
+    // 8-16x slower than native code. So we will just leave their calibration
+    // as-is and hope it's not too wildly off in practice.
+    fuel_costs
+}
+
+pub(crate) fn get_wasmi_config(
+    budget: &Budget,
+    mut cmode: CompilationMode,
+) -> Result<wasmi::Config, HostError> {
+    let mut config = wasmi::Config::default();
+    let fuel_costs = budget.0.try_borrow_or_err()?.fuel_costs;
+
+    let enforced_limits = if cfg!(feature = "bench") {
+        // Disable limits when benchmarking, to allow large inputs.
+        EnforcedLimits::default()
+    } else {
+        let mut limits = EnforcedLimits::strict();
+        // We mostly use the new "strict" limits, which are designed to minimize
+        // the possibility of DoS Wasms, but we turn off one: the one that
+        // rejects Wasms when the average size of functions is too small. This
+        // is a potential DoS, but only when there are in fact lots of
+        // functions; we expect that given the total size limit of the Wasms in
+        // the network it's not going to be a real DoS for us, and it's fairly
+        // easy to trigger in practice with benign inputs like test wasms.
+        limits.min_avg_bytes_per_function = None;
+        limits
+    };
+
+    if cfg!(feature = "bench") {
+        // Allow overriding compilation mode for special benchmark mode.
+        if std::env::var("CHECK_LAZY_COMPILATION_COSTS").is_ok() {
+            cmode = CompilationMode::Lazy;
+        }
+    }
+    // Turn off most optional wasm features, leaving on some post-MVP features
+    // commonly enabled by Rust and Clang. Make sure all unused features are
+    // explicited turned off, so that we don't get "opted in" by a future wasmi
+    // version.
+    config
+        .consume_fuel(true)
+        .wasm_bulk_memory(true)
+        .wasm_mutable_global(true)
+        .wasm_sign_extension(true)
+        .wasm_saturating_float_to_int(false)
+        .wasm_multi_value(false)
+        .wasm_reference_types(false)
+        .wasm_tail_call(false)
+        .wasm_extended_const(false)
+        .floats(false)
+        .set_fuel_costs(fuel_costs)
+        .enforced_limits(enforced_limits)
+        .compilation_mode(cmode);
+
+    Ok(config)
 }

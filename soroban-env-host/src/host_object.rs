@@ -1,53 +1,25 @@
 #![allow(dead_code)]
 
-use soroban_env_common::{
-    xdr::{ContractCostType, ScErrorCode, ScErrorType},
-    Compare, DurationSmall, I128Small, I256Small, I64Small, SymbolSmall, SymbolStr, TimepointSmall,
-    TryFromVal, U128Small, U256Small, U64Small,
-};
-
 use crate::{
     budget::Budget,
-    host::metered_clone::{self, MeteredClone},
-    HostError,
-};
-
-use super::{
-    host::metered_map::MeteredOrdMap,
-    host::metered_vector::MeteredVector,
+    host::{
+        metered_clone::{self, MeteredClone},
+        metered_map::MeteredOrdMap,
+        metered_vector::MeteredVector,
+    },
     num::{I256, U256},
-    xdr, AddressObject, BytesObject, DurationObject, Host, I128Object, I256Object, I64Object,
-    MapObject, Object, StringObject, SymbolObject, TimepointObject, U128Object, U256Object,
-    U64Object, Val, VecObject,
+    xdr::{self, ContractCostType, ScErrorCode, ScErrorType, SCSYMBOL_LIMIT},
+    AddressObject, BytesObject, Compare, DurationObject, DurationSmall, Host, HostError,
+    I128Object, I128Small, I256Object, I256Small, I64Object, I64Small, MapObject, Object,
+    StringObject, SymbolObject, SymbolSmall, SymbolStr, TimepointObject, TimepointSmall,
+    TryFromVal, U128Object, U128Small, U256Object, U256Small, U64Object, U64Small, Val, VecObject,
 };
 
 pub(crate) type HostMap = MeteredOrdMap<Val, Val, Host>;
 pub(crate) type HostVec = MeteredVector<Val>;
 
-#[cfg(feature = "testutils")]
-impl std::hash::Hash for HostVec {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.vec.len().hash(state);
-        for x in self.vec.iter() {
-            x.get_payload().hash(state);
-        }
-    }
-}
-
-#[cfg(feature = "testutils")]
-impl std::hash::Hash for HostMap {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.len().hash(state);
-        for (k, v) in self.map.iter() {
-            k.get_payload().hash(state);
-            v.get_payload().hash(state);
-        }
-    }
-}
-
-#[derive(Clone)]
-#[cfg_attr(feature = "testutils", derive(Hash))]
-pub enum HostObject {
+#[derive(Clone, Hash)]
+pub(crate) enum HostObject {
     Vec(HostVec),
     Map(HostMap),
     U64(u64),
@@ -62,6 +34,27 @@ pub enum HostObject {
     String(xdr::ScString),
     Symbol(xdr::ScSymbol),
     Address(xdr::ScAddress),
+}
+
+impl std::fmt::Debug for HostObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Vec(arg0) => f.debug_tuple("Vec").field(&arg0.len()).finish(),
+            Self::Map(arg0) => f.debug_tuple("Map").field(&arg0.len()).finish(),
+            Self::U64(arg0) => f.debug_tuple("U64").field(arg0).finish(),
+            Self::I64(arg0) => f.debug_tuple("I64").field(arg0).finish(),
+            Self::TimePoint(arg0) => f.debug_tuple("TimePoint").field(arg0).finish(),
+            Self::Duration(arg0) => f.debug_tuple("Duration").field(arg0).finish(),
+            Self::U128(arg0) => f.debug_tuple("U128").field(arg0).finish(),
+            Self::I128(arg0) => f.debug_tuple("I128").field(arg0).finish(),
+            Self::U256(arg0) => f.debug_tuple("U256").field(arg0).finish(),
+            Self::I256(arg0) => f.debug_tuple("I256").field(arg0).finish(),
+            Self::Bytes(arg0) => f.debug_tuple("Bytes").field(arg0).finish(),
+            Self::String(arg0) => f.debug_tuple("String").field(arg0).finish(),
+            Self::Symbol(arg0) => f.debug_tuple("Symbol").field(arg0).finish(),
+            Self::Address(arg0) => f.debug_tuple("Address").field(arg0).finish(),
+        }
+    }
 }
 
 impl HostObject {
@@ -149,7 +142,7 @@ impl HostObject {
     }
 }
 
-pub trait HostObjectType: MeteredClone {
+pub(crate) trait HostObjectType: MeteredClone {
     type Wrapper: Into<Object>;
     fn new_from_handle(handle: u32) -> Self::Wrapper;
     fn inject(self) -> HostObject;
@@ -161,6 +154,7 @@ pub trait HostObjectType: MeteredClone {
 pub(crate) trait MemHostObjectType:
     HostObjectType + TryFrom<Vec<u8>, Error = xdr::Error> + Into<Vec<u8>>
 {
+    fn try_from_bytes(host: &Host, bytes: Vec<u8>) -> Result<Self, HostError>;
     fn as_byte_slice(&self) -> &[u8];
 }
 
@@ -189,6 +183,10 @@ macro_rules! declare_mem_host_object_type {
     ($TY:ty, $TAG:ident, $CASE:ident) => {
         declare_host_object_type!($TY, $TAG, $CASE);
         impl MemHostObjectType for $TY {
+            fn try_from_bytes(_host: &Host, bytes: Vec<u8>) -> Result<Self, HostError> {
+                Self::try_from(bytes).map_err(Into::into)
+            }
+
             fn as_byte_slice(&self) -> &[u8] {
                 self.as_slice()
             }
@@ -209,8 +207,35 @@ declare_host_object_type!(U256, U256Object, U256);
 declare_host_object_type!(I256, I256Object, I256);
 declare_mem_host_object_type!(xdr::ScBytes, BytesObject, Bytes);
 declare_mem_host_object_type!(xdr::ScString, StringObject, String);
-declare_mem_host_object_type!(xdr::ScSymbol, SymbolObject, Symbol);
+declare_host_object_type!(xdr::ScSymbol, SymbolObject, Symbol);
 declare_host_object_type!(xdr::ScAddress, AddressObject, Address);
+
+impl MemHostObjectType for xdr::ScSymbol {
+    fn try_from_bytes(host: &Host, bytes: Vec<u8>) -> Result<Self, HostError> {
+        if bytes.len() as u64 > SCSYMBOL_LIMIT {
+            return Err(host.err(
+                ScErrorType::Value,
+                ScErrorCode::InvalidInput,
+                "slice is too long to be represented as Symbol",
+                &[(bytes.len() as u32).into()],
+            ));
+        }
+        for b in &bytes {
+            SymbolSmall::validate_byte(*b).map_err(|_| {
+                host.err(
+                    ScErrorType::Value,
+                    ScErrorCode::InvalidInput,
+                    "byte is not allowed in Symbol",
+                    &[(*b as u32).into()],
+                )
+            })?;
+        }
+        Self::try_from(bytes).map_err(Into::into)
+    }
+    fn as_byte_slice(&self) -> &[u8] {
+        self.as_ref()
+    }
+}
 
 // Objects come in two flavors: relative and absolute. They are differentiated
 // by the low bit of the object handle: relative objects have 0, absolutes have
@@ -239,9 +264,10 @@ declare_host_object_type!(xdr::ScAddress, AddressObject, Address);
 // when running native contracts, either builtin or in local-testing mode, so
 // you will not get identical object numbers in those cases. Since there is no
 // real isolation between native contracts -- they can even dereference unsafe
-// pointers if they want -- there's no point bothering with the translation (and
-// there's no really obvious place to perform it systematically, like in the
-// wasm marshalling path).
+// pointers if they want -- the lack of translation is not exactly making the
+// security of native testing worse than it already is. But it does reduce the
+// fidelity of VM-mode simulation in native testing mode. See
+// https://github.com/stellar/rs-soroban-env/issues/1286 for a planned fix.
 
 pub fn is_relative_object_handle(handle: u32) -> bool {
     handle & 1 == 0
@@ -346,9 +372,9 @@ impl Host {
         Ok(val)
     }
 
-    /// Moves a value of some type implementing [`HostObjectType`] into the host's
-    /// object array, returning a [`HostObj`] containing the new object's array
-    /// index, tagged with the [`xdr::ScObjectType`].
+    /// Moves a value of some type implementing [`HostObjectType`] into the
+    /// host's object array, returning the associated [`Object`] wrapper type
+    /// containing the new object's handle.
     pub(crate) fn add_host_object<HOT: HostObjectType>(
         &self,
         hot: HOT,
@@ -356,8 +382,8 @@ impl Host {
         let _span = tracy_span!("add host object");
         let index = self.try_borrow_objects()?.len();
         let handle = index_to_handle(self, index, false)?;
-        // charge for the new host object, which is just the amortized cost of a single
-        // `HostObject` allocation
+        // charge for the new host object, which is just the amortized cost of a
+        // single `HostObject` allocation
         metered_clone::charge_heap_alloc::<HostObject>(1, self)?;
         self.try_borrow_objects_mut()?.push(HOT::inject(hot));
         Ok(HOT::new_from_handle(handle))
@@ -374,9 +400,10 @@ impl Host {
         let _span = tracy_span!("visit host object");
         // `VisitObject` covers the cost of visiting an object. The actual cost
         // of the closure needs to be covered by the caller. Although each visit
-        // does small amount of work: getting the object handling and indexing
-        // into the host object buffer, it is ubiquitous and therefore we charge
-        // budget here for safety / future proofing.
+        // does small amount of work -- getting the object handling and indexing
+        // into the host object buffer, almost too little to bother charging for
+        // -- it is ubiquitous and therefore we charge budget here for safety /
+        // future proofing.
         self.charge_budget(ContractCostType::VisitObject, None)?;
         let r = self.try_borrow_objects()?;
         let obj: Object = obj.into();
@@ -409,8 +436,8 @@ impl Host {
         }
     }
 
-    // Notes on metering: object visiting part is covered by unchecked_visit_val_obj. Closure function
-    // needs to be metered separately.
+    // Notes on metering: object visiting part is covered by
+    // [`Host::visit_obj_untyped`]. Closure needs to be metered separately.
     pub(crate) fn visit_obj<HOT: HostObjectType, F, U>(
         &self,
         obj: HOT::Wrapper,

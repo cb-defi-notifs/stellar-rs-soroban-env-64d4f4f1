@@ -1,23 +1,27 @@
-use super::account_contract::{ContractAuthorizationContext, CreateContractHostFnContext};
-use super::common_types::ContractExecutable;
-use crate::budget::AsBudget;
-use crate::host::metered_clone::{MeteredClone, MeteredContainer};
-use crate::host_object::HostVec;
 use crate::{
     auth::{AuthorizedFunction, AuthorizedInvocation, ContractFunction},
-    builtin_contracts::base_types::Vec as ContractTypeVec,
-    Host, HostError,
+    budget::AsBudget,
+    builtin_contracts::{
+        account_contract::{
+            ContractAuthorizationContext, CreateContractHostFnContext,
+            CreateContractWithConstructorHostFnContext,
+        },
+        base_types::Vec as ContractTypeVec,
+        common_types::ContractExecutable,
+    },
+    host::metered_clone::{MeteredClone, MeteredContainer},
+    host_object::HostVec,
+    xdr::{
+        self, ContractIdPreimage, ContractIdPreimageFromAddress, CreateContractArgsV2, ScAddress,
+        ScErrorCode, ScErrorType,
+    },
+    Host, HostError, TryFromVal, TryIntoVal, Val,
 };
 use soroban_builtin_sdk_macros::contracttype;
-use soroban_env_common::xdr::{
-    self, ContractIdPreimage, ContractIdPreimageFromAddress, CreateContractArgs, ScAddress,
-    ScErrorCode, ScErrorType,
-};
-use soroban_env_common::{TryFromVal, TryIntoVal, Val};
 
 #[derive(Clone)]
 #[contracttype]
-pub struct SubContractInvocation {
+pub(crate) struct SubContractInvocation {
     pub context: ContractAuthorizationContext,
     pub sub_invocations: ContractTypeVec, // Vec of InvokerContractAuthEntry
 }
@@ -28,9 +32,10 @@ pub struct SubContractInvocation {
 /// contract.
 #[derive(Clone)]
 #[contracttype]
-pub enum InvokerContractAuthEntry {
+pub(crate) enum InvokerContractAuthEntry {
     Contract(SubContractInvocation),
     CreateContractHostFn(CreateContractHostFnContext),
+    CreateContractWithCtorHostFn(CreateContractWithConstructorHostFnContext),
 }
 
 // metering: covered
@@ -83,7 +88,7 @@ impl InvokerContractAuthEntry {
                         ));
                     }
                 };
-                let function = AuthorizedFunction::CreateContractHostFn(CreateContractArgs {
+                let function = AuthorizedFunction::CreateContractHostFn(CreateContractArgsV2 {
                     contract_id_preimage: ContractIdPreimage::Address(
                         ContractIdPreimageFromAddress {
                             address: invoker_contract_addr.metered_clone(host)?,
@@ -94,6 +99,37 @@ impl InvokerContractAuthEntry {
                         },
                     ),
                     executable: xdr::ContractExecutable::Wasm(wasm_hash),
+                    constructor_args: Default::default(),
+                });
+                Ok(AuthorizedInvocation::new(function, vec![]))
+            }
+            InvokerContractAuthEntry::CreateContractWithCtorHostFn(create_contract_fn) => {
+                let wasm_hash = match &create_contract_fn.executable {
+                    ContractExecutable::Wasm(b) => {
+                        host.hash_from_bytesobj_input("wasm_ref", b.as_object())?
+                    }
+                    ContractExecutable::StellarAsset => {
+                        return Err(host.err(
+                            ScErrorType::Auth,
+                            ScErrorCode::InternalError,
+                            "unexpected authorized StellarAsset contract creation",
+                            &[],
+                        ));
+                    }
+                };
+                let function = AuthorizedFunction::CreateContractHostFn(CreateContractArgsV2 {
+                    contract_id_preimage: ContractIdPreimage::Address(
+                        ContractIdPreimageFromAddress {
+                            address: invoker_contract_addr.metered_clone(host)?,
+                            salt: host.u256_from_bytesobj_input(
+                                "salt",
+                                create_contract_fn.salt.as_object(),
+                            )?,
+                        },
+                    ),
+                    executable: xdr::ContractExecutable::Wasm(wasm_hash),
+                    constructor_args: host
+                        .vecobject_to_scval_vec(create_contract_fn.constructor_args.as_object())?,
                 });
                 Ok(AuthorizedInvocation::new(function, vec![]))
             }

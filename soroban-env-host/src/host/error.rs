@@ -1,7 +1,7 @@
 use crate::{
     budget::AsBudget,
     events::Events,
-    xdr::{self, Hash, LedgerKey, ScAddress, ScError, ScErrorCode, ScErrorType},
+    xdr::{self, LedgerKey, ScAddress, ScError, ScErrorCode, ScErrorType},
     ConversionError, EnvBase, Error, Host, TryFromVal, U32Val, Val,
 };
 
@@ -11,7 +11,6 @@ use core::fmt::Debug;
 use std::{
     cell::{Ref, RefCell, RefMut},
     ops::DerefMut,
-    rc::Rc,
 };
 
 use super::metered_clone::MeteredClone;
@@ -37,9 +36,16 @@ impl Into<Error> for HostError {
     }
 }
 
+impl From<HostError> for wasmi::Error {
+    fn from(e: HostError) -> Self {
+        wasmi::Error::host(e)
+    }
+}
+
 impl DebugInfo {
     fn write_events(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // TODO: maybe make this something users can adjust?
+        // https://github.com/stellar/rs-soroban-env/issues/1288
         const MAX_EVENTS: usize = 25;
         let mut wrote_heading = false;
         for (i, e) in self.events.0.iter().rev().take(MAX_EVENTS).enumerate() {
@@ -95,6 +101,10 @@ impl DebugInfo {
                 || frame_name_matches(frame, "Host::err")
                 || frame_name_matches(frame, "Host>::err")
                 || frame_name_matches(frame, "::augment_err_result")
+                || frame_name_matches(frame, "::with_shadow_mode")
+                || frame_name_matches(frame, "::with_debug_mode")
+                || frame_name_matches(frame, "::maybe_get_debug_info")
+                || frame_name_matches(frame, "::map_err")
         }
         let mut bt = self.backtrace.clone();
         bt.resolve();
@@ -131,9 +141,18 @@ impl HostError {
         Error: From<C>,
     {
         match res {
-            Ok(_) => false,
+            Ok(_) => {
+                eprintln!("result is not an error");
+                false
+            }
             Err(he) => {
                 let error: Error = code.into();
+                if he.error != error {
+                    eprintln!(
+                        "expected error != actual error: {:?} != {:?}",
+                        error, he.error
+                    );
+                }
                 he.error == error
             }
         }
@@ -227,17 +246,23 @@ impl<T> TryBorrowOrErr<T> for RefCell<T> {
 
 impl Host {
     /// Convenience function to construct an [Error] and pass to [Host::error].
-    pub fn err(&self, type_: ScErrorType, code: ScErrorCode, msg: &str, args: &[Val]) -> HostError {
+    pub(crate) fn err(
+        &self,
+        type_: ScErrorType,
+        code: ScErrorCode,
+        msg: &str,
+        args: &[Val],
+    ) -> HostError {
         let error = Error::from_type_and_code(type_, code);
         self.error(error, msg, args)
     }
 
-    /// At minimum constructs and returns a [HostError] build from the provided
+    /// At minimum constructs and returns a [HostError] built from the provided
     /// [Error], and when running in [DiagnosticMode::Debug] additionally
     /// records a diagnostic event with the provided `msg` and `args` and then
     /// enriches the returned [Error] with [DebugInfo] in the form of a
     /// [Backtrace] and snapshot of the [Events] buffer.
-    pub fn error(&self, error: Error, msg: &str, args: &[Val]) -> HostError {
+    pub(crate) fn error(&self, error: Error, msg: &str, args: &[Val]) -> HostError {
         let mut he = HostError::from(error);
         self.with_debug_mode(|| {
             // We _try_ to take a mutable borrow of the events buffer refcell
@@ -327,7 +352,7 @@ impl Host {
     /// will wind up writing `host.map_err(...)?` a bunch in code that you used
     /// to be able to get away with just writing `...?`, there's no way around
     /// this if we want to record the diagnostic information.
-    pub fn map_err<T, E>(&self, res: Result<T, E>) -> Result<T, HostError>
+    pub(crate) fn map_err<T, E>(&self, res: Result<T, E>) -> Result<T, HostError>
     where
         Error: From<E>,
         E: Debug,
@@ -349,8 +374,8 @@ impl Host {
     // Extracts the account id from the given ledger key as address object `Val`.
     // Returns Void for unsupported entries.
     // Useful as a helper for error reporting.
-    pub(crate) fn account_address_from_key(&self, lk: &Rc<LedgerKey>) -> Result<Val, HostError> {
-        let account_id = match lk.as_ref() {
+    pub(crate) fn account_address_from_key(&self, lk: &LedgerKey) -> Result<Val, HostError> {
+        let account_id = match lk {
             LedgerKey::Account(e) => &e.account_id,
             LedgerKey::Trustline(e) => &e.account_id,
             _ => {
@@ -362,109 +387,13 @@ impl Host {
         ))
         .map(|a| a.to_val())
     }
-
-    pub(crate) fn decorate_account_footprint_error(
-        &self,
-        err: HostError,
-        lk: &Rc<LedgerKey>,
-        msg: &str,
-    ) -> HostError {
-        if err.error.is_type(ScErrorType::Storage) && err.error.is_code(ScErrorCode::ExceededLimit)
-        {
-            let account_address = self.account_address_from_key(lk);
-            match account_address {
-                Ok(account_address) => {
-                    return self.err(
-                        ScErrorType::Storage,
-                        ScErrorCode::ExceededLimit,
-                        msg,
-                        &[account_address],
-                    );
-                }
-                Err(e) => {
-                    return e;
-                }
-            }
-        }
-        err
-    }
-
-    pub(crate) fn decorate_contract_data_storage_error(
-        &self,
-        err: HostError,
-        key: Val,
-    ) -> HostError {
-        if !err.error.is_type(ScErrorType::Storage) {
-            return err;
-        }
-        if err.error.is_code(ScErrorCode::ExceededLimit) {
-            return self.err(
-                ScErrorType::Storage,
-                ScErrorCode::ExceededLimit,
-                "trying to access contract storage key outside of the footprint",
-                &[key],
-            );
-        }
-        if err.error.is_code(ScErrorCode::MissingValue) {
-            return self.err(
-                ScErrorType::Storage,
-                ScErrorCode::MissingValue,
-                "trying to get non-existing value for contract storage key",
-                &[key],
-            );
-        }
-        err
-    }
-
-    pub(crate) fn decorate_contract_instance_storage_error(
-        &self,
-        err: HostError,
-        contract_id: &Hash,
-    ) -> HostError {
-        if err.error.is_type(ScErrorType::Storage) && err.error.is_code(ScErrorCode::ExceededLimit)
-        {
-            return self.err(
-                ScErrorType::Storage,
-                ScErrorCode::ExceededLimit,
-                "trying to access contract instance key outside of the footprint",
-                // No need for metered clone here as we are on the unrecoverable
-                // error path.
-                &[self
-                    .add_host_object(ScAddress::Contract(contract_id.clone()))
-                    .map(|a| a.into())
-                    .unwrap_or(Val::VOID.into())],
-            );
-        }
-        err
-    }
-
-    pub(crate) fn decorate_contract_code_storage_error(
-        &self,
-        err: HostError,
-        wasm_hash: &Hash,
-    ) -> HostError {
-        if err.error.is_type(ScErrorType::Storage) && err.error.is_code(ScErrorCode::ExceededLimit)
-        {
-            return self.err(
-                ScErrorType::Storage,
-                ScErrorCode::ExceededLimit,
-                "trying to access contract code key outside of the footprint",
-                // No need for metered clone here as we are on the unrecoverable
-                // error path.
-                &[self
-                    .add_host_object(self.scbytes_from_hash(wasm_hash).unwrap_or_default())
-                    .map(|a| a.into())
-                    .unwrap_or(Val::VOID.into())],
-            );
-        }
-        err
-    }
 }
 
 pub(crate) trait DebugArg {
     fn debug_arg(host: &Host, arg: &Self) -> Val {
-        // We similarly guard against double-faulting here by try-acquiring the event buffer,
-        // which will fail if we're re-entering error reporting _while_ forming a debug argument.
+        // We similarly guard against double-faulting here by try-acquiring the
+        // event buffer, which will fail if we're re-entering error reporting
+        // _while_ forming a debug argument.
         let mut val: Option<Val> = None;
         if let Ok(_guard) = host.0.events.try_borrow_mut() {
             host.with_debug_mode(|| {
@@ -501,7 +430,7 @@ impl DebugArg for xdr::Hash {
 
 impl DebugArg for str {
     fn debug_arg_maybe_expensive_or_fallible(host: &Host, arg: &Self) -> Result<Val, HostError> {
-        host.string_new_from_slice(arg).map(|s| s.into())
+        host.string_new_from_slice(arg.as_bytes()).map(|s| s.into())
     }
 }
 
@@ -531,8 +460,9 @@ macro_rules! err {
             }
             // The stringify and voidarg calls here exist just to cause the
             // macro to stack-allocate a fixed-size local array with one VOID
-            // initializer per argument. The arguments themselves are not
-            // actually used at this point.
+            // initializer per argument. The stringified-arguments themselves
+            // are not actually used at this point, they exist to have a macro
+            // expression that corresponds to the number of arguments.
             let mut buf = [$(voidarg(stringify!($args))),*];
             let mut i = 0;
             $host.with_debug_mode(||{

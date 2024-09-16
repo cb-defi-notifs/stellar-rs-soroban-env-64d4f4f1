@@ -16,15 +16,16 @@
 //! pointers. The rest of each struct is considered its "shallow" part and
 //! charged based on its declared size (see [`DeclaredSizeForMetering`]).
 
-use std::{iter::FromIterator, mem, rc::Rc};
+use std::{cell::RefCell, mem, rc::Rc};
 
 use crate::{
     budget::{AsBudget, DepthLimiter},
     builtin_contracts::base_types::Address,
     storage::AccessType,
     xdr::{
-        AccountEntry, AccountId, Asset, BytesM, ContractCodeEntry, ContractCostType,
-        ContractExecutable, ContractIdPreimage, CreateContractArgs, Duration, Hash,
+        AccountEntry, AccountId, Asset, BytesM, ContractCodeCostInputs, ContractCodeEntry,
+        ContractCodeEntryExt, ContractCodeEntryV1, ContractCostType, ContractExecutable,
+        ContractIdPreimage, CreateContractArgs, CreateContractArgsV2, Duration, Hash,
         InvokeContractArgs, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey,
         LedgerKeyAccount, LedgerKeyContractCode, LedgerKeyTrustLine, PublicKey, ScAddress, ScBytes,
         ScContractInstance, ScErrorCode, ScErrorType, ScMap, ScMapEntry, ScNonceKey, ScString,
@@ -112,16 +113,32 @@ where
         charge_heap_alloc::<Self::Item>(len, budget.clone())?;
         charge_shallow_copy::<Self::Item>(len, budget)
     }
+
+    /// Metered version of the container's `with_capacity` method.
+    fn with_metered_capacity(capacity: usize, budget: impl AsBudget) -> Result<Self, HostError>;
 }
 
 impl<T: DeclaredSizeForMetering> MeteredContainer for Vec<T> {
     type Item = T;
+
+    fn with_metered_capacity(capacity: usize, budget: impl AsBudget) -> Result<Self, HostError> {
+        Self::charge_bulk_init_cpy(capacity as u64, budget)?;
+        Ok(Vec::with_capacity(capacity))
+    }
 }
 
+/// This is implemented in order `metered_collect` a `Vec<Result<T, E>>` into a
+/// `Result<Vec<T>, E>`. It is only supposed to exist for charging purpose.
 impl<T: DeclaredSizeForMetering, E: DeclaredSizeForMetering> MeteredContainer
     for Result<Vec<T>, E>
 {
     type Item = Result<T, E>;
+
+    /// This function will return an error. It is not expected to initialize a
+    /// `Result<Vec<T, E>>` with capacity.
+    fn with_metered_capacity(_capacity: usize, _budget: impl AsBudget) -> Result<Self, HostError> {
+        Err(Error::from_type_and_code(ScErrorType::Object, ScErrorCode::InvalidAction).into())
+    }
 }
 
 /// Represents an iterator which can collect its elements into a `MeteredContainer`
@@ -298,6 +315,8 @@ impl MeteredClone for TimePoint {}
 impl MeteredClone for Duration {}
 impl MeteredClone for Hash {}
 impl MeteredClone for Uint256 {}
+impl MeteredClone for ContractCodeCostInputs {}
+impl MeteredClone for ContractCodeEntryV1 {}
 impl MeteredClone for ContractExecutable {}
 impl MeteredClone for AccountId {}
 impl MeteredClone for ScAddress {}
@@ -321,6 +340,15 @@ impl MeteredClone for Asset {}
 
 // cloning Rc is just a ref-count bump
 impl<T> MeteredClone for Rc<T> {}
+
+// cloning a RefCell clones its underlying data structure
+impl<T: MeteredClone> MeteredClone for RefCell<T> {
+    const IS_SHALLOW: bool = T::IS_SHALLOW;
+
+    fn charge_for_substructure(&self, budget: impl AsBudget) -> Result<(), HostError> {
+        self.borrow().charge_for_substructure(budget)
+    }
+}
 
 impl<K, V> MeteredClone for (K, V)
 where
@@ -532,6 +560,11 @@ impl MeteredClone for ContractCodeEntry {
     const IS_SHALLOW: bool = false;
 
     fn charge_for_substructure(&self, budget: impl AsBudget) -> Result<(), HostError> {
+        // self.ext is a former ExtensionEntry; see note on ExtensionEntry in declared_size.rs
+        match &self.ext {
+            ContractCodeEntryExt::V0 => (),
+            ContractCodeEntryExt::V1(v1) => v1.charge_for_substructure(budget.clone())?,
+        }
         self.code.charge_for_substructure(budget)
     }
 }
@@ -603,6 +636,9 @@ impl MeteredClone for SorobanAuthorizedFunction {
             SorobanAuthorizedFunction::ContractFn(c) => c.charge_for_substructure(budget),
             // CreateContractArgs has no substructure.
             SorobanAuthorizedFunction::CreateContractHostFn(_) => Ok(()),
+            SorobanAuthorizedFunction::CreateContractV2HostFn(c) => {
+                c.charge_for_substructure(budget)
+            }
         }
     }
 }
@@ -616,4 +652,14 @@ impl MeteredClone for InvokeContractArgs {
     }
 }
 
+impl MeteredClone for CreateContractArgsV2 {
+    const IS_SHALLOW: bool = false;
+
+    fn charge_for_substructure(&self, budget: impl AsBudget) -> Result<(), HostError> {
+        self.contract_id_preimage
+            .charge_for_substructure(budget.clone())?;
+        self.executable.charge_for_substructure(budget.clone())?;
+        self.constructor_args.charge_for_substructure(budget)
+    }
+}
 // endregion: xdr types with substructure

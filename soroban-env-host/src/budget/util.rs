@@ -2,7 +2,7 @@
     test,
     feature = "testutils",
     feature = "bench",
-    feature = "recording_auth"
+    feature = "recording_mode"
 ))]
 use crate::{budget::Budget, HostError};
 
@@ -30,11 +30,6 @@ impl Budget {
 
     pub fn get_wasm_mem_alloc(&self) -> Result<u64, HostError> {
         Ok(self.0.try_borrow_or_err()?.tracker.wasm_memory)
-    }
-
-    pub fn reset_default(&self) -> Result<(), HostError> {
-        *self.0.try_borrow_mut_or_err()? = super::BudgetImpl::default();
-        Ok(())
     }
 
     pub fn reset_unlimited(&self) -> Result<(), HostError> {
@@ -74,6 +69,14 @@ impl Budget {
         Ok(())
     }
 
+    pub fn reset_cpu_limit(&self, cpu: u64) -> Result<(), HostError> {
+        self.with_mut_budget(|mut b| {
+            b.cpu_insns.reset(cpu);
+            Ok(())
+        })?;
+        self.reset_tracker()
+    }
+
     pub fn reset_limits(&self, cpu: u64, mem: u64) -> Result<(), HostError> {
         self.with_mut_budget(|mut b| {
             b.cpu_insns.reset(cpu);
@@ -91,7 +94,7 @@ impl Budget {
     /// of a specific fuel category. In order to get the correct, unscaled fuel
     /// count, we have to preset all the `FuelConfig` entries to 1.
     pub fn reset_fuel_config(&self) -> Result<(), HostError> {
-        self.0.try_borrow_mut_or_err()?.fuel_config.reset();
+        self.0.try_borrow_mut_or_err()?.fuel_costs = wasmi::FuelCosts::default();
         Ok(())
     }
 
@@ -125,19 +128,12 @@ impl Budget {
         const_mem: u64,
         lin_mem: ScaledU64,
     ) -> Result<(), HostError> {
-        use crate::xdr::{ScErrorCode, ScErrorType};
-
         let mut bgt = self.0.try_borrow_mut_or_err()?;
-
-        let Some(cpu_model) = bgt.cpu_insns.get_cost_model_mut(ty) else {
-            return Err((ScErrorType::Budget, ScErrorCode::InternalError).into());
-        };
+        let cpu_model = bgt.cpu_insns.get_cost_model_mut(ty)?;
         cpu_model.const_term = const_cpu;
         cpu_model.lin_term = lin_cpu;
 
-        let Some(mem_model) = bgt.mem_bytes.get_cost_model_mut(ty) else {
-            return Err((ScErrorType::Budget, ScErrorCode::InternalError).into());
-        };
+        let mem_model = bgt.mem_bytes.get_cost_model_mut(ty)?;
         mem_model.const_term = const_mem;
         mem_model.lin_term = lin_mem;
         Ok(())
@@ -161,7 +157,7 @@ impl Budget {
     }
 }
 
-#[cfg(any(test, feature = "recording_auth"))]
+#[cfg(any(test, feature = "recording_mode"))]
 impl Budget {
     /// Variant of `with_shadow_mode`, enabled only in testing and
     /// non-production scenarios, that produces a `Result<>` rather than eating
@@ -174,7 +170,7 @@ impl Budget {
     ///
     /// However, in testing and non-production workflows, sometimes we need the
     /// convenience of temporarily "turning off" the budget. This can happen for
-    /// several reasons: we want the some test logic to not affect the
+    /// several reasons: we want some test logic to not affect the
     /// production budget, or we want to maintain an accurate prediction of
     /// production budget during preflight. In the latter case, we want to
     /// exclude preflight-only logic from the budget. By routing metering to the

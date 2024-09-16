@@ -1,6 +1,6 @@
 use crate::{
     budget::AsBudget,
-    host::{Frame, VmSlice},
+    host::Frame,
     host_object::MemHostObjectType,
     xdr::{ContractCostType, ScErrorCode, ScErrorType, ScSymbol},
     Compare, Host, HostError, Symbol, SymbolObject, SymbolSmall, SymbolStr, U32Val, Vm, VmCaller,
@@ -8,26 +8,64 @@ use crate::{
 
 use std::{cmp::Ordering, rc::Rc};
 
+/// Helper type for host functions that receive a position and length pair and
+/// expect to operate on a VM. Pos and len are not validated and len may be a
+/// count of bytes, Vals or slices depending on the host function.
+pub(crate) struct MemFnArgs {
+    pub(crate) vm: Rc<Vm>,
+    pub(crate) pos: u32,
+    pub(crate) len: u32,
+}
+
+// For future reference:
+//
+// (Note: there is no good place to put this but maybe someone grepping for
+// "memory map" or "stack" or "__heap_base" will find it, please don't
+// delete this comment as I have to re-derive it from primary sources every
+// time I need to remember it):
+//
+// The default rust-wasm memory map looks like:
+//
+//             0x0010_0000        __heap_base
+//             a.k.a. 1MiB        __data_end
+// +----------------+-----------------+-----------------+
+// |          stack |  static data    |  heap           |
+// | <-- grows down |   (fixed)       |  grows up -->   |
+// +----------------+-----------------+-----------------+
+//
+// This is controlled by linker args, specifically
+// -z stack-size=1048576 and --stack-first
+// both of which are passed by the LLD rust backend
+// when writing wasm, see:
+//
+// https://github.com/rust-lang/rust/blob/master/compiler/rustc_target/src/spec/base/wasm.rs
+//
+// In case it seems odd that __heap_base and __data_end are
+// the same, this is (as far as I can tell) just an artifact
+// of --stack_first. The "conventional" wasm memory map has
+// the stack _between_ the data and heap, so those two symbols
+// would normally be different. But if you move the stack to
+// the beginning of memory, then the data and heap are adjacent
+// and so the symbols are the same.
+
 impl Host {
     // Notes on metering: free
-    // TODO: this function is confusing, it isn't decoding anything, it is
-    // merely cloning out the VM and copy in whatever pos and len values have
-    // been passed in, evne if those pos or len does not correspond to the vm
-    // linear memory range. Does not perform any range checks It is being used
-    // wrong in several places. e.g. in map_new_from_linear_memory, the len is
-    // actually the number of slices, not the number of bytes.
-    // Tracking issue https://github.com/stellar/rs-soroban-env/issues/1225
-    pub(crate) fn decode_vmslice(&self, pos: U32Val, len: U32Val) -> Result<VmSlice, HostError> {
+    // Helper for the first step in most functions that operate on linear
+    // memory. Converts a pos and len from U32Vals to plain u32, and extracts
+    // the current frame's vm. Does not validate anything about the pos and len
+    // and does not even specify what len is a count of: some uses count bytes,
+    // others count Vals or slices.
+    pub(crate) fn get_mem_fn_args(&self, pos: U32Val, len: U32Val) -> Result<MemFnArgs, HostError> {
         let pos: u32 = pos.into();
         let len: u32 = len.into();
         self.with_current_frame(|frame| match frame {
             Frame::ContractVM { vm, .. } => {
                 let vm = Rc::clone(&vm);
-                Ok(VmSlice { vm, pos, len })
+                Ok(MemFnArgs { vm, pos, len })
             }
             _ => Err(self.err(
                 ScErrorType::WasmVm,
-                ScErrorCode::InvalidAction,
+                ScErrorCode::InternalError,
                 "attempt to access guest bytes in non-VM frame",
                 &[],
             )),
@@ -45,7 +83,7 @@ impl Host {
         let mem = vm.get_memory(self)?;
         self.map_err(
             mem.write(vmcaller.try_mut()?, mem_pos as usize, buf)
-                .map_err(|me| wasmi::Error::Memory(me)),
+                .map_err(|me| wasmi::Error::from(me)),
         )
     }
 
@@ -60,7 +98,7 @@ impl Host {
         let mem = vm.get_memory(self)?;
         self.map_err(
             mem.read(vmcaller.try_mut()?, mem_pos as usize, buf)
-                .map_err(|me| wasmi::Error::Memory(me)),
+                .map_err(|me| wasmi::Error::from(me)),
         )
     }
 
@@ -166,11 +204,11 @@ impl Host {
     // function, only make it read junk memory in the guest and therefore likely
     // cause the callback to return an error.
     //
-    // Notes on metering: metering for this function covers memcpy of the `slices`
-    // , each of which is a 8 byte memory (4 byte pos + 4 byte len). The actual
-    // content pointed to by each slice is accessed and passed into the closure
-    // as a reference so there is no cost to it. The actual cost of work done on
-    // the slice needs to be metered in the closure by the caller.
+    // Notes on metering: metering for this function covers memcpy of the
+    // `slices`, each of which is 8 bytes of memory (4 byte pos + 4 byte len).
+    // The actual content pointed to by each slice is accessed and passed into
+    // the closure as a reference so there is no cost to it. The actual cost of
+    // work done on the slice needs to be metered in the closure by the caller.
     pub(crate) fn metered_vm_scan_slices_in_linear_memory(
         &self,
         vmcaller: &mut VmCaller<Host>,
@@ -180,8 +218,8 @@ impl Host {
         mut callback: impl FnMut(usize, &[u8]) -> Result<(), HostError>,
     ) -> Result<(), HostError> {
         let mem_data = vm.get_memory(self)?.data(vmcaller.try_mut()?);
-        // charge the cost of copying the slices (pointera to the content, not
-        // the content themselves) upfront
+        // charge the cost of copying the slices (pointers to the content, not
+        // the content themselves) upfront.
         self.charge_budget(
             ContractCostType::MemCpy,
             Some((num_slices as u64).saturating_mul(8)),
@@ -222,17 +260,6 @@ impl Host {
                     &[],
                 ));
             }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn scan_slice_of_slices(
-        &self,
-        slices: &[&str],
-        mut callback: impl FnMut(usize, &str) -> Result<(), HostError>,
-    ) -> Result<(), HostError> {
-        for (i, slice) in slices.iter().enumerate() {
-            callback(i, slice)?;
         }
         Ok(())
     }
@@ -299,7 +326,7 @@ impl Host {
         lm_pos: U32Val,
         len: U32Val,
     ) -> Result<(), HostError> {
-        let VmSlice { vm, pos, len } = self.decode_vmslice(lm_pos, len)?;
+        let MemFnArgs { vm, pos, len } = self.get_mem_fn_args(lm_pos, len)?;
         self.memobj_visit_and_copy_bytes_out::<HOT>(obj, obj_pos, len, |obj_buf| {
             self.metered_vm_write_bytes_to_linear_memory(vmcaller, &vm, pos, obj_buf)
         })
@@ -323,7 +350,7 @@ impl Host {
         if obj_new.len() < obj_end {
             self.charge_budget(
                 ContractCostType::MemAlloc,
-                Some((obj_end - obj_new.len()) as u64),
+                Some((obj_end.saturating_sub(obj_new.len())) as u64),
             )?;
             obj_new.resize(obj_end, 0);
         }
@@ -337,7 +364,7 @@ impl Host {
             )
         })?;
         copy_bytes_in(obj_buf)?;
-        self.add_host_object(HOT::try_from(obj_new)?)
+        self.add_host_object(HOT::try_from_bytes(self, obj_new)?)
     }
 
     pub(crate) fn memobj_copy_from_slice<HOT: MemHostObjectType>(
@@ -360,7 +387,7 @@ impl Host {
         lm_pos: U32Val,
         len: U32Val,
     ) -> Result<HOT::Wrapper, HostError> {
-        let VmSlice { vm, pos, len } = self.decode_vmslice(lm_pos, len)?;
+        let MemFnArgs { vm, pos, len } = self.get_mem_fn_args(lm_pos, len)?;
         self.memobj_clone_resize_and_copy_bytes_in::<HOT>(obj, obj_pos, len, |obj_buf| {
             self.metered_vm_read_bytes_from_linear_memory(vmcaller, &vm, pos, obj_buf)
         })
@@ -372,11 +399,11 @@ impl Host {
         lm_pos: U32Val,
         len: U32Val,
     ) -> Result<HOT::Wrapper, HostError> {
-        let VmSlice { vm, pos, len } = self.decode_vmslice(lm_pos, len)?;
+        let MemFnArgs { vm, pos, len } = self.get_mem_fn_args(lm_pos, len)?;
         self.charge_budget(ContractCostType::MemAlloc, Some(len as u64))?;
         let mut vnew: Vec<u8> = vec![0; len as usize];
         self.metered_vm_read_bytes_from_linear_memory(vmcaller, &vm, pos, &mut vnew)?;
-        self.add_host_object::<HOT>(vnew.try_into()?)
+        self.add_host_object::<HOT>(HOT::try_from_bytes(self, vnew)?)
     }
 
     pub(crate) fn symbol_matches(&self, s: &[u8], sym: Symbol) -> Result<bool, HostError> {

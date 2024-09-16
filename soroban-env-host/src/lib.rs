@@ -37,13 +37,18 @@ pub use vm::Vm;
 pub mod storage;
 pub use budget::{DEFAULT_HOST_DEPTH_LIMIT, DEFAULT_XDR_RW_LIMITS};
 pub use host::{
-    metered_map::MeteredOrdMap, metered_vector::MeteredVector, Host, HostError, LedgerInfo, Seed,
-    SEED_BYTES,
+    metered_map::MeteredOrdMap, metered_vector::MeteredVector, Host, HostError, Seed, SEED_BYTES,
 };
 pub use soroban_env_common::*;
 
+pub mod ledger_info;
+pub use ledger_info::LedgerInfo;
+
 pub mod e2e_invoke;
 pub mod fees;
+
+#[doc(hidden)]
+pub use host::{TraceEvent, TraceHook, TraceRecord, TraceState};
 
 #[cfg(feature = "bench")]
 #[doc(hidden)]
@@ -56,5 +61,8 @@ pub use host::{ContractFunctionSet, ContractInvocationEvent};
 #[doc(hidden)]
 pub mod testutils;
 
+#[cfg(any(test, feature = "testutils"))]
+#[doc(hidden)]
+pub mod e2e_testutils;
 #[cfg(test)]
 mod test;
